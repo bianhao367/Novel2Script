@@ -2,30 +2,30 @@
 
 import yaml
 
-from pydantic import BaseModel, Field, ValidationError
+from typing import Literal, Annotated, Union
+from pydantic import BaseModel, Field, ValidationError, Discriminator
 
 
 # --- Pydantic 模型定义剧本结构 ---
 
-class Dialogue(BaseModel):
-    """单句对白"""
+class DialogueItem(BaseModel):
+    """场景中的一句对白"""
+    type: Literal["dialogue"]
     character: str                             # 说话角色名
     line: str                                  # 台词正文
     parenthetical: str = ""                    # 情绪/动作提示（括号注）
 
 
-class Action(BaseModel):
-    """动作/舞台指示"""
+class ActionItem(BaseModel):
+    """场景中的一条动作/舞台指示"""
+    type: Literal["action"]
     text: str                                  # 动作描述
 
 
-class ContentItem(BaseModel):
-    """场景内容单元：对白或动作"""
-    type: str                                  # "dialogue" 或 "action"
-    character: str = ""                        # dialogue 专用
-    line: str = ""                             # dialogue 专用
-    parenthetical: str = ""                    # dialogue 专用
-    text: str = ""                             # action 专用
+ContentItem = Annotated[
+    Union[DialogueItem, ActionItem],
+    Discriminator("type"),
+]
 
 
 class Scene(BaseModel):
