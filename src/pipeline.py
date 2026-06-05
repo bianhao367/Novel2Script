@@ -15,7 +15,7 @@ class Pipeline:
 
     def __init__(self, config: Config):
         self.config = config
-        self.llm = LLMClient(config.api)
+        self.llm = LLMClient(config)
         self.output_dir = Path(config.pipeline.output_dir)
 
     def run(self, novel_path: str | Path) -> Script:
@@ -42,7 +42,7 @@ class Pipeline:
         print(f"已构造 prompt: {len(messages)} 条消息, 约 {len(chunk)} 字符的小说文本")
 
         # 4. 调用 LLM
-        print(f"正在调用 {self.config.api.model} ...")
+        print(f"正在调用 {self.config.model} ...")
         raw_output = self.llm.chat(messages)
         print(f"收到响应: {len(raw_output)} 字符")
 
@@ -70,8 +70,8 @@ class Pipeline:
         return script
 
 
-def run_pipeline(novel_path: str, config_path: str = ".config") -> Script:
+def run_pipeline(novel_path: str) -> Script:
     """快捷函数：加载配置并运行流程。"""
-    config = load_config(config_path)
+    config = load_config()
     pipeline = Pipeline(config)
     return pipeline.run(novel_path)

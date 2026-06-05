@@ -2,7 +2,7 @@
 """Novel2Script —— 将小说文本转换为结构化剧本（基于 LLM）。
 
 用法:
-    python main.py <小说.txt> [--config .config]
+    python main.py <小说.txt>
 """
 
 import argparse
@@ -19,15 +19,10 @@ def main():
         "novel_path",
         help="小说 .txt 文件路径",
     )
-    parser.add_argument(
-        "--config", "-c",
-        default=".config",
-        help="配置文件路径（默认: .config）",
-    )
     args = parser.parse_args()
 
     try:
-        script = run_pipeline(args.novel_path, config_path=args.config)
+        script = run_pipeline(args.novel_path)
         print(f"\n完成。剧本标题: {script.title}")
     except FileNotFoundError as e:
         print(f"错误: 文件未找到 — {e}", file=sys.stderr)

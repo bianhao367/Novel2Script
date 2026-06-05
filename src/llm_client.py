@@ -2,17 +2,17 @@
 
 from openai import OpenAI
 
-from src.config import ApiConfig
+from src.config import Config
 
 
 class LLMClient:
     """OpenAI Python SDK 的薄封装。"""
 
-    def __init__(self, config: ApiConfig):
+    def __init__(self, config: Config):
         self.config = config
         self._client = OpenAI(
-            base_url=config.base_url,
-            api_key=config.api_key,
+            base_url=config.api.base_url,
+            api_key=config.api.api_key,
         )
 
     def chat(self, messages: list[dict]) -> str:

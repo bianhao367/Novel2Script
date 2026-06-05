@@ -1,12 +1,12 @@
-# Config (contains API keys)
-.config
+# API 凭据
+.env
 
 # Python
 __pycache__/
 *.pyc
 
-# Virtual environment
+# 虚拟环境
 .venv/
 
-# Output
+# 生成输出
 output/

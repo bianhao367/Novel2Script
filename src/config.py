@@ -1,19 +1,22 @@
-"""配置加载器 —— 读取 .config 文件（INI 格式）并解析 ${VAR} 环境变量占位符。"""
+"""配置加载器 —— 从 .env 读取 API 凭据，从 config.py 读取运行参数，统一为 Config 对象。"""
 
 import os
-import re
-from configparser import ConfigParser
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+# 项目根目录（main.py 所在位置）
+ROOT_DIR = Path(__file__).resolve().parent.parent
+
+# 加载 .env 中的环境变量
+load_dotenv(ROOT_DIR / ".env")
 
 
 @dataclass
 class ApiConfig:
-    base_url: str = "https://api.openai.com/v1"
-    api_key: str = ""
-    model: str = "gpt-4o"
-    temperature: float = 0.7
-    max_tokens: int = 4096
+    base_url: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    api_key: str = os.getenv("OPENAI_API_KEY", "")
 
 
 @dataclass
@@ -27,36 +30,33 @@ class PipelineConfig:
 class Config:
     api: ApiConfig = field(default_factory=ApiConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
+    # 额外存储原始读取值供参考
+    model: str = ""
+    temperature: float = 0.7
+    max_tokens: int = 4096
 
 
-def _resolve_env(value: str) -> str:
-    """将字符串中的 ${VAR_NAME} 替换为对应的环境变量值。"""
-    pattern = re.compile(r"\$\{(\w+)\}")
-    for var in pattern.findall(value):
-        value = value.replace(f"${{{var}}}", os.environ.get(var, ""))
-    return value
+def load_config() -> Config:
+    """加载配置：API 凭据来自 .env，运行参数来自根目录 config.py。"""
+    import importlib.util
 
+    # 从根目录 config.py 读取参数
+    root_config_path = ROOT_DIR / "config.py"
+    spec = importlib.util.spec_from_file_location("root_config", root_config_path)
+    root_cfg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(root_cfg)
 
-def load_config(path: str | Path = ".config") -> Config:
-    """从 .config 文件加载配置。"""
-    cp = ConfigParser()
-    cp.read(path, encoding="utf-8")
-
-    api_section = dict(cp.items("api")) if cp.has_section("api") else {}
-    pipeline_section = dict(cp.items("pipeline")) if cp.has_section("pipeline") else {}
-
-    api_cfg = ApiConfig(
-        base_url=_resolve_env(api_section.get("base_url", ApiConfig.base_url)),
-        api_key=_resolve_env(api_section.get("api_key", "")),
-        model=api_section.get("model", ApiConfig.model),
-        temperature=float(api_section.get("temperature", ApiConfig.temperature)),
-        max_tokens=int(api_section.get("max_tokens", ApiConfig.max_tokens)),
-    )
-
+    api_cfg = ApiConfig()
     pipeline_cfg = PipelineConfig(
-        chunk_size=int(pipeline_section.get("chunk_size", PipelineConfig.chunk_size)),
-        output_dir=pipeline_section.get("output_dir", PipelineConfig.output_dir),
-        output_format=pipeline_section.get("output_format", PipelineConfig.output_format),
+        chunk_size=getattr(root_cfg, "CHUNK_SIZE", 3000),
+        output_dir=getattr(root_cfg, "OUTPUT_DIR", "./output"),
+        output_format=getattr(root_cfg, "OUTPUT_FORMAT", "yaml"),
     )
 
-    return Config(api=api_cfg, pipeline=pipeline_cfg)
+    return Config(
+        api=api_cfg,
+        pipeline=pipeline_cfg,
+        model=getattr(root_cfg, "MODEL", "gpt-4o"),
+        temperature=getattr(root_cfg, "TEMPERATURE", 0.7),
+        max_tokens=getattr(root_cfg, "MAX_TOKENS", 4096),
+    )
