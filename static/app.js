@@ -246,10 +246,11 @@ async function handleSend() {
                 addAiError(detail, showThinking.checked ? JSON.stringify(err, null, 2) : null);
             } else {
                 // 流式读取 SSE 事件流
-                const streamingId = addAiStreaming();
+                const streamingId = addAiStreaming(showThinking.checked ? '思考' : null);
                 const reader = res.body.getReader();
                 const decoder = new TextDecoder();
                 let fullContent = '';
+                let fullReasoning = '';
                 let readerDone = false;
 
                 while (!readerDone) {
@@ -264,7 +265,10 @@ async function handleSend() {
                                 if (payload === '[DONE]') continue;
                                 try {
                                     const parsed = JSON.parse(payload);
-                                    if (parsed.content) {
+                                    if (parsed.type === 'reasoning') {
+                                        fullReasoning += parsed.content;
+                                        updateThinkingContent(streamingId, fullReasoning);
+                                    } else if (parsed.type === 'content') {
                                         fullContent += parsed.content;
                                         updateAiStreaming(streamingId, fullContent);
                                     } else if (parsed.error) {
@@ -348,21 +352,14 @@ function addAiLoading() {
     return id;
 }
 
-/** 纯文本 AI 回复 */
-function addAiText(text, rawContext) {
+/** 纯文本 AI 回复（非流式回退） */
+function addAiText(text) {
     const id = 'msg-' + Date.now();
-    let rawBlock = '';
-    if (rawContext) {
-        rawBlock = `<div class="thinking-block">
-            <button class="thinking-toggle" onclick="this.nextElementSibling.classList.toggle('visible')">查看剧本上下文</button>
-            <div class="thinking-content">${escapeHtml(rawContext)}</div>
-           </div>`;
-    }
     const html = `
         <div class="message ai" id="${id}">
             <div class="message-avatar">AI</div>
             <div class="message-body">
-                <div class="bubble">${escapeHtml(text)}${rawBlock}</div>
+                <div class="bubble">${escapeHtml(text)}</div>
             </div>
         </div>`;
     chatArea.insertAdjacentHTML('beforeend', html);
@@ -394,18 +391,14 @@ function addAiScript(data, showRaw) {
         ? data.scenes.map(s => `第${s.scene_number}场: ${escapeHtml(s.slugline || '未标场地')} (${s.dialogue_count}句对白, ${s.action_count}条动作)`).join('\n')
         : '';
 
-    const rawJson = data.script ? JSON.stringify(data.script, null, 2) : '';
-    const rawBlock = showRaw && rawJson
-        ? `<div class="thinking-block">
-            <button class="thinking-toggle" onclick="this.nextElementSibling.classList.toggle('visible')">查看原始数据</button>
-            <div class="thinking-content visible">${escapeHtml(rawJson)}</div>
-           </div>`
-        : '';
+    const rawJson = showRaw && data.script ? JSON.stringify(data.script, null, 2) : '';
+    const thinkingHtml = rawJson ? thinkingBoxHtml(id, '原始数据', rawJson) : '';
 
     const html = `
         <div class="message ai" id="${id}">
             <div class="message-avatar">AI</div>
             <div class="message-body">
+                ${thinkingHtml}
                 <div class="bubble">
                     <div class="ai-header">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
@@ -417,7 +410,6 @@ function addAiScript(data, showRaw) {
                         <div class="card-label">场次概览</div>
                         <pre>${scenesList}</pre>
                     </div>
-                    ${rawBlock}
                     <p style="margin-top:14px;font-size:13px;color:var(--text-muted);">
                         剧本已保存至 output/${escapeHtml(data.novel_name)}/script.yaml。你可以继续在下方输入消息，让我帮你修改剧本。
                     </p>
@@ -430,20 +422,14 @@ function addAiScript(data, showRaw) {
 
 function addAiError(detail, rawText) {
     const id = 'msg-err-' + Date.now();
-    let rawBlock = '';
-    if (rawText) {
-        rawBlock = `<div class="thinking-block">
-            <button class="thinking-toggle" onclick="this.nextElementSibling.classList.toggle('visible')">查看原始响应</button>
-            <div class="thinking-content">${escapeHtml(rawText)}</div>
-           </div>`;
-    }
+    const thinkingHtml = rawText ? thinkingBoxHtml(id, '原始响应', rawText) : '';
     const html = `
         <div class="message ai" id="${id}">
             <div class="message-avatar">AI</div>
             <div class="message-body">
+                ${thinkingHtml}
                 <div class="bubble">
                     <div class="error-block">${escapeHtml(detail)}</div>
-                    ${rawBlock}
                 </div>
             </div>
         </div>`;
@@ -452,12 +438,14 @@ function addAiError(detail, rawText) {
 }
 
 /** 创建流式输出的消息气泡（初始为空，带闪烁光标） */
-function addAiStreaming() {
+function addAiStreaming(thinkingLabel) {
     const id = 'msg-stream-' + Date.now();
+    const thinkingHtml = thinkingLabel ? thinkingBoxHtml(id, thinkingLabel, '') : '';
     const html = `
         <div class="message ai" id="${id}">
             <div class="message-avatar">AI</div>
             <div class="message-body">
+                ${thinkingHtml}
                 <div class="bubble">
                     <div class="streaming-content streaming" id="${id}-content"></div>
                 </div>
@@ -477,10 +465,32 @@ function updateAiStreaming(msgId, content) {
     }
 }
 
+/** 更新流式思考内容框（LLM 推理过程流入此框） */
+function updateThinkingContent(msgId, content) {
+    const body = document.getElementById(msgId + '-thinking-body');
+    if (body) {
+        body.textContent = content;
+        if (!body.classList.contains('open')) body.classList.add('open');
+        scrollToBottom();
+    }
+}
+
 /** 流式输出完成，移除闪烁光标 */
 function finalizeAiStreaming(msgId) {
     const el = document.getElementById(msgId + '-content');
     if (el) el.classList.remove('streaming');
+}
+
+/** 思考内容框 HTML 片段 */
+function thinkingBoxHtml(id, label, content) {
+    const openClass = content ? ' open' : '';
+    return `<div class="thinking-box" id="${id}-thinking">
+        <div class="thinking-header" onclick="this.nextElementSibling.classList.toggle('open')">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+            <span>${escapeHtml(label)}</span>
+        </div>
+        <div class="thinking-body${openClass}" id="${id}-thinking-body">${content ? escapeHtml(content) : ''}</div>
+    </div>`;
 }
 
 function removeMessage(id) {

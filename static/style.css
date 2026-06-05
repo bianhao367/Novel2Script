@@ -210,7 +210,7 @@ body {
     border-radius: var(--radius-lg) var(--radius-lg) var(--radius-lg) 4px;
     padding: 8px 14px;
     font-size: 14px;
-    line-height: 1.6;
+    line-height: 1.65;
     box-shadow: var(--shadow-sm);
     word-break: break-word;
     width: fit-content;
@@ -324,53 +324,53 @@ body {
     font-weight: 500;
 }
 
-/* 原始输出（思考内容） */
-.thinking-block {
-    margin-top: 14px;
-    border-top: 1px dashed var(--border);
-    padding-top: 12px;
+/* 思考内容框（气泡上方） */
+.thinking-box {
+    background: #f3f4f6;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    margin-bottom: 6px;
+    overflow: hidden;
+    width: fit-content;
+    max-width: 100%;
 }
 
-.thinking-toggle {
-    display: inline-flex;
+.thinking-header {
+    display: flex;
     align-items: center;
     gap: 6px;
+    padding: 5px 12px;
     font-size: 12px;
-    color: var(--text-muted);
+    color: #9ca3af;
     cursor: pointer;
-    background: none;
-    border: none;
-    padding: 4px 0;
-    transition: color 0.15s;
+    user-select: none;
 }
 
-.thinking-toggle:hover { color: var(--text-secondary); }
+.thinking-header:hover {
+    background: #e5e7eb;
+    color: #6b7280;
+}
 
-.thinking-content {
-    margin-top: 10px;
-    background: #fefce8;
-    border: 1px solid #fde68a;
-    border-radius: var(--radius-sm);
-    padding: 14px 16px;
-    font-family: var(--font-mono);
+.thinking-body {
+    padding: 6px 12px 8px;
     font-size: 12px;
+    color: #6b7280;
     line-height: 1.5;
-    color: #92400e;
     white-space: pre-wrap;
     word-break: break-word;
-    max-height: 300px;
+    max-height: 200px;
     overflow-y: auto;
+    border-top: 1px solid #e5e7eb;
     display: none;
+    font-family: var(--font-mono);
 }
 
-.thinking-content.visible { display: block; }
+.thinking-body.open {
+    display: block;
+}
 
 /* 流式输出光标 */
-.streaming-content {
-    white-space: pre-wrap;
-    word-break: break-word;
-    line-height: 1.6;
-}
+.streaming-content { white-space: pre-wrap; word-break: break-word; }
 .streaming-content.streaming::after {
     content: '▊';
     animation: stream-blink 0.8s step-end infinite;

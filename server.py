@@ -158,7 +158,7 @@ def chat(req: ChatRequest):
     def event_generator():
         try:
             for chunk in llm.chat_stream(messages):
-                yield f"data: {json.dumps({'content': chunk}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
         except LLMError as e:
             yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"

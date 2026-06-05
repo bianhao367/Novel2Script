@@ -86,7 +86,7 @@ class LLMClient:
         raise LLMError(f"调用失败: {last_error}")
 
     def chat_stream(self, messages: list[dict]):
-        """Streaming chat completion，逐个 yield 文本块。"""
+        """Streaming chat completion，逐个 yield {"type": "reasoning"|"content", "content": str}。"""
         last_error: Exception | None = None
         delay = 2.0
 
@@ -102,8 +102,12 @@ class LLMClient:
                 )
                 for chunk in stream:
                     delta = chunk.choices[0].delta if chunk.choices else None
-                    if delta and delta.content:
-                        yield delta.content
+                    if delta:
+                        rc = getattr(delta, 'reasoning_content', None)
+                        if rc:
+                            yield {"type": "reasoning", "content": rc}
+                        if delta.content:
+                            yield {"type": "content", "content": delta.content}
                 return  # 成功完成
 
             except AuthenticationError as e:
