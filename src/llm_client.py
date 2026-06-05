@@ -84,3 +84,59 @@ class LLMClient:
 
         # 理论上不会走到这里，但兜底
         raise LLMError(f"调用失败: {last_error}")
+
+    def chat_stream(self, messages: list[dict]):
+        """Streaming chat completion，逐个 yield 文本块。"""
+        last_error: Exception | None = None
+        delay = 2.0
+
+        for attempt in range(3):
+            try:
+                stream = self._client.chat.completions.create(
+                    model=self.config.model,
+                    messages=messages,
+                    temperature=self.config.temperature,
+                    max_tokens=self.config.max_tokens,
+                    stream=True,
+                    stream_options={"include_usage": False},
+                )
+                for chunk in stream:
+                    delta = chunk.choices[0].delta if chunk.choices else None
+                    if delta and delta.content:
+                        yield delta.content
+                return  # 成功完成
+
+            except AuthenticationError as e:
+                raise LLMError(f"API 认证失败: {e}") from e
+
+            except RateLimitError as e:
+                last_error = e
+                if attempt < 2:
+                    print(f"速率限制，{delay:.0f}s 后重试 (第{attempt+1}/3次)...")
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    raise LLMError(f"速率限制，已重试3次: {e}") from e
+
+            except APITimeoutError as e:
+                last_error = e
+                if attempt < 2:
+                    print(f"请求超时，{delay:.0f}s 后重试 (第{attempt+1}/3次)...")
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    raise LLMError(f"请求超时，已重试3次: {e}") from e
+
+            except APIConnectionError as e:
+                last_error = e
+                if attempt < 2:
+                    print(f"连接失败，{delay:.0f}s 后重试 (第{attempt+1}/3次)...")
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    raise LLMError(f"连接失败，已重试3次: {e}") from e
+
+            except APIError as e:
+                raise LLMError(f"API 错误: {e}") from e
+
+        raise LLMError(f"调用失败: {last_error}")

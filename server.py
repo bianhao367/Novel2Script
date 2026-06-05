@@ -1,11 +1,12 @@
 """Novel2Script API —— 将小说 .txt 文件转换为结构化剧本的 HTTP 服务。"""
 
+import json
 import tempfile
 import traceback
 from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -33,6 +34,7 @@ class ChatRequest(BaseModel):
     model: str = ""
     base_url: str = ""
     api_key: str = ""
+    stream: bool = True
 
 
 # --- 工具 ---
@@ -135,7 +137,7 @@ def convert(
 
 @app.post("/api/v1/chat")
 def chat(req: ChatRequest):
-    """常规 AI 对话。"""
+    """常规 AI 对话，支持 SSE 流式输出。"""
     config = _apply_settings(load_config(), req.model, req.base_url, req.api_key)
     llm = LLMClient(config)
 
@@ -145,14 +147,34 @@ def chat(req: ChatRequest):
 
     messages = [{"role": "system", "content": system_msg}] + req.messages
 
-    try:
-        reply = llm.chat(messages)
-        return {"reply": reply}
-    except LLMError as e:
-        raise HTTPException(status_code=502, detail=f"LLM 调用失败: {e}")
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"服务器内部错误: {e}")
+    if not req.stream:
+        try:
+            reply = llm.chat(messages)
+            return {"reply": reply}
+        except LLMError as e:
+            raise HTTPException(status_code=502, detail=f"LLM 调用失败: {e}")
+
+    # --- SSE 流式输出 ---
+    def event_generator():
+        try:
+            for chunk in llm.chat_stream(messages):
+                yield f"data: {json.dumps({'content': chunk}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+        except LLMError as e:
+            yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            traceback.print_exc()
+            yield f"data: {json.dumps({'error': f'服务器内部错误: {e}'}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/api/v1/schema")

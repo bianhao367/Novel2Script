@@ -220,7 +220,7 @@ async function handleSend() {
                 addAiScript(data, showThinking.checked);
             }
         } else {
-            // --- 文本模式：调用 /api/v1/chat ---
+            // --- 文本模式：调用 /api/v1/chat (SSE 流式) ---
             conversationHistory.push({
                 role: 'user',
                 content: text,
@@ -232,6 +232,7 @@ async function handleSend() {
                 body: JSON.stringify({
                     messages: conversationHistory,
                     script_context: scriptContext,
+                    stream: true,
                     ...getApiParams(),
                 }),
             });
@@ -241,15 +242,46 @@ async function handleSend() {
             if (!res.ok) {
                 const err = await res.json();
                 const detail = err.error || err.detail || `HTTP ${res.status}`;
-                conversationHistory.pop(); // 回滚失败的消息
+                conversationHistory.pop();
                 addAiError(detail, showThinking.checked ? JSON.stringify(err, null, 2) : null);
             } else {
-                const data = await res.json();
+                // 流式读取 SSE 事件流
+                const streamingId = addAiStreaming();
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let fullContent = '';
+                let readerDone = false;
+
+                while (!readerDone) {
+                    const { done, value } = await reader.read();
+                    readerDone = done;
+                    if (value) {
+                        const chunk = decoder.decode(value, { stream: !done });
+                        const lines = chunk.split('\n');
+                        for (const line of lines) {
+                            if (line.startsWith('data: ')) {
+                                const payload = line.slice(6);
+                                if (payload === '[DONE]') continue;
+                                try {
+                                    const parsed = JSON.parse(payload);
+                                    if (parsed.content) {
+                                        fullContent += parsed.content;
+                                        updateAiStreaming(streamingId, fullContent);
+                                    } else if (parsed.error) {
+                                        conversationHistory.pop();
+                                        addAiError(parsed.error, null);
+                                    }
+                                } catch (_) { /* 忽略不完整的 JSON 行 */ }
+                            }
+                        }
+                    }
+                }
+
+                finalizeAiStreaming(streamingId);
                 conversationHistory.push({
                     role: 'assistant',
-                    content: data.reply,
+                    content: fullContent,
                 });
-                addAiText(data.reply, showThinking.checked ? scriptContext : '');
             }
         }
     } catch (err) {
@@ -417,6 +449,38 @@ function addAiError(detail, rawText) {
         </div>`;
     chatArea.insertAdjacentHTML('beforeend', html);
     return id;
+}
+
+/** 创建流式输出的消息气泡（初始为空，带闪烁光标） */
+function addAiStreaming() {
+    const id = 'msg-stream-' + Date.now();
+    const html = `
+        <div class="message ai" id="${id}">
+            <div class="message-avatar">AI</div>
+            <div class="message-body">
+                <div class="bubble">
+                    <div class="streaming-content streaming" id="${id}-content"></div>
+                </div>
+            </div>
+        </div>`;
+    chatArea.insertAdjacentHTML('beforeend', html);
+    scrollToBottom();
+    return id;
+}
+
+/** 更新流式气泡中的文本 */
+function updateAiStreaming(msgId, content) {
+    const el = document.getElementById(msgId + '-content');
+    if (el) {
+        el.textContent = content;
+        scrollToBottom();
+    }
+}
+
+/** 流式输出完成，移除闪烁光标 */
+function finalizeAiStreaming(msgId) {
+    const el = document.getElementById(msgId + '-content');
+    if (el) el.classList.remove('streaming');
 }
 
 function removeMessage(id) {
