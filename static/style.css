@@ -167,7 +167,7 @@ body {
     font-weight: 500;
 }
 
-.settings-btn {
+.icon-btn {
     display: flex;
     align-items: center;
     justify-content: center;
@@ -181,10 +181,15 @@ body {
     transition: all var(--transition-fast);
 }
 
-.settings-btn:hover {
+.icon-btn:hover:not(:disabled) {
     background: var(--accent-light);
     color: var(--accent);
     border-color: var(--accent);
+}
+
+.icon-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
 }
 
 /* ====== 聊天区域 ====== */

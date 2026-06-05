@@ -24,6 +24,10 @@ const statusIndicator = document.getElementById('statusIndicator');
 const statusDot     = statusIndicator.querySelector('.status-dot');
 const statusText    = statusIndicator.querySelector('.status-text');
 
+// 对话管理
+const clearBtn      = document.getElementById('clearBtn');
+const exportBtn     = document.getElementById('exportBtn');
+
 // 设置弹窗
 const settingsBtn   = document.getElementById('settingsBtn');
 const settingsModal = document.getElementById('settingsModal');
@@ -55,6 +59,10 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 function bindEvents() {
+    // 对话管理
+    clearBtn.addEventListener('click', clearConversation);
+    exportBtn.addEventListener('click', exportScript);
+
     // 设置弹窗
     settingsBtn.addEventListener('click', openSettings);
     modalClose.addEventListener('click', closeSettings);
@@ -186,6 +194,37 @@ function getApiParams() {
     };
 }
 
+// ====== 对话管理 ======
+
+function clearConversation() {
+    if (conversationHistory.length === 0 && !scriptContext) return;
+    if (!confirm('确定清空所有对话和剧本上下文？')) return;
+
+    conversationHistory = [];
+    scriptContext = '';
+    exportBtn.disabled = true;
+
+    // 移除所有消息，保留欢迎页
+    chatArea.querySelectorAll('.message').forEach(el => el.remove());
+    if (welcome) welcome.style.display = '';
+    showToast('对话已清空', 'info');
+}
+
+function exportScript() {
+    if (!scriptContext) {
+        showToast('没有可导出的剧本', 'error');
+        return;
+    }
+    const blob = new Blob([scriptContext], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'script.json';
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast('剧本已导出', 'success');
+}
+
 // ====== 字数统计 ======
 
 function updateCharCount() {
@@ -269,6 +308,7 @@ async function handleSend() {
                     scenes: data.scenes,
                     characters: data.characters,
                 }, null, 2);
+                exportBtn.disabled = false;
                 conversationHistory.push({ role: 'user', content: displayText });
                 conversationHistory.push({
                     role: 'assistant',
