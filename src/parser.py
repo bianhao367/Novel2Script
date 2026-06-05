@@ -1,4 +1,4 @@
-"""YAML 解析与校验 —— 解析 LLM 返回的 YAML 并用 Pydantic 模型校验。"""
+"""YAML 解析与校验 —— 解析 LLM 返回的 YAML 并用 Pydantic 模型校验剧本结构。"""
 
 import yaml
 
@@ -9,24 +9,30 @@ from pydantic import BaseModel, Field, ValidationError
 
 class Dialogue(BaseModel):
     """单句对白"""
-    character: str
-    line: str
-    action: str = ""
+    character: str                             # 说话角色名
+    line: str                                  # 台词正文
+    parenthetical: str = ""                    # 情绪/动作提示（括号注）
+
+
+class Action(BaseModel):
+    """动作/舞台指示"""
+    text: str                                  # 动作描述
+
+
+class ContentItem(BaseModel):
+    """场景内容单元：对白或动作"""
+    type: str                                  # "dialogue" 或 "action"
+    character: str = ""                        # dialogue 专用
+    line: str = ""                             # dialogue 专用
+    parenthetical: str = ""                    # dialogue 专用
+    text: str = ""                             # action 专用
 
 
 class Scene(BaseModel):
     """单场戏"""
     scene_number: int
-    setting: str = ""
-    characters_present: list[str] = Field(default_factory=list)
-    dialogues: list[Dialogue] = Field(default_factory=list)
-    stage_directions: str = ""
-
-
-class Act(BaseModel):
-    """一幕（包含多场）"""
-    act_number: int
-    scenes: list[Scene] = Field(default_factory=list)
+    slugline: str = ""                         # 场标（如"内. 古宅 - 夜"）
+    content: list[ContentItem] = Field(default_factory=list)
 
 
 class CharacterInfo(BaseModel):
@@ -38,11 +44,11 @@ class CharacterInfo(BaseModel):
 class Script(BaseModel):
     """完整剧本"""
     title: str = "Untitled"
-    acts: list[Act] = Field(default_factory=list)
+    scenes: list[Scene] = Field(default_factory=list)
     characters: list[CharacterInfo] = Field(default_factory=list)
 
 
-# 导出 Schema 类供 schema_gen 使用
+# 导出供 schema_gen 使用
 SCRIPT_SCHEMA = Script
 
 

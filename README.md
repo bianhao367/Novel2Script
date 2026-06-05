@@ -65,23 +65,22 @@ OUTPUT_DIR = "./output"
 
 ```yaml
 title: "剧本标题"
-acts:
-  - act_number: 1
-    scenes:
-      - scene_number: 1
-        setting: "场景描述"
-        characters_present:
-          - "角色A"
-          - "角色B"
-        dialogues:
-          - character: "角色A"
-            line: "台词"
-            action: "动作/情绪提示"
-        stage_directions: "舞台指示"
+scenes:
+  - scene_number: 1
+    slugline: "内. 古宅门厅 - 夜"
+    content:                      # 动作与对白按演出顺序交错排列
+      - type: "action"
+        text: "林侦探推开吱呀作响的橡木门。"
+      - type: "dialogue"
+        character: "林侦探"
+        parenthetical: "警惕地"
+        line: "有人在吗？"
 characters:
-  - name: "角色A"
-    description: "角色简介"
+  - name: "林侦探"
+    description: "一名谨慎冷静的侦探"
 ```
+
+> Schema 设计原因详见 [docs/yaml_schema.md](docs/yaml_schema.md)
 
 ## 命令行参数
 

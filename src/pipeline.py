@@ -53,7 +53,13 @@ class Pipeline:
 
         # 5. 解析与校验
         script = parse_yaml(raw_output)
-        print(f"已校验剧本: {len(script.acts)} 幕, {len(script.characters)} 个角色")
+        dialogue_count = sum(
+            1 for s in script.scenes for c in s.content if c.type == "dialogue"
+        )
+        action_count = sum(
+            1 for s in script.scenes for c in s.content if c.type == "action"
+        )
+        print(f"已校验剧本: {len(script.scenes)} 场, {dialogue_count} 句对白, {action_count} 条动作, {len(script.characters)} 个角色")
 
         # 6. 保存规范化 YAML
         yaml_path = novel_dir / "script.yaml"
