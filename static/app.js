@@ -1,36 +1,44 @@
 /**
  * Novel2Script — 前端交互逻辑
- *   - 常规 AI 对话（文字输入 → /api/v1/chat）
+ *   - 常规 AI 对话（文字输入 → /api/v1/chat，SSE 流式）
  *   - 小说转剧本（文件上传 → /api/v1/convert）
  *   - 对话历史 + 剧本上下文在两种模式间共享
  */
 
 // ====== DOM 引用 ======
-const chatArea   = document.getElementById('chatArea');
-const welcome    = document.getElementById('welcome');
-const fileInput  = document.getElementById('fileInput');
-const fileBtn    = document.getElementById('fileBtn');
-const fileChip   = document.getElementById('fileChip');
-const chipName   = fileChip.querySelector('.file-chip-name');
-const chipRemove = fileChip.querySelector('.file-chip-remove');
-const textInput  = document.getElementById('textInput');
-const sendBtn    = document.getElementById('sendBtn');
-const showThinking = document.getElementById('showThinking');
+const chatArea      = document.getElementById('chatArea');
+const welcome       = document.getElementById('welcome');
+const fileInput     = document.getElementById('fileInput');
+const fileBtn       = document.getElementById('fileBtn');
+const fileChip      = document.getElementById('fileChip');
+const chipName      = fileChip.querySelector('.file-chip-name');
+const chipRemove    = fileChip.querySelector('.file-chip-remove');
+const textInput     = document.getElementById('textInput');
+const sendBtn       = document.getElementById('sendBtn');
+const showThinking  = document.getElementById('showThinking');
+const charCount     = document.getElementById('charCount');
+const toastContainer = document.getElementById('toastContainer');
+
+// 状态指示器
+const statusIndicator = document.getElementById('statusIndicator');
+const statusDot     = statusIndicator.querySelector('.status-dot');
+const statusText    = statusIndicator.querySelector('.status-text');
 
 // 设置弹窗
-const settingsBtn  = document.getElementById('settingsBtn');
+const settingsBtn   = document.getElementById('settingsBtn');
 const settingsModal = document.getElementById('settingsModal');
-const modalClose   = document.getElementById('modalClose');
-const modalCancel  = document.getElementById('modalCancel');
-const modalSave    = document.getElementById('modalSave');
-const setBaseUrl   = document.getElementById('setBaseUrl');
-const setApiKey    = document.getElementById('setApiKey');
-const setModel     = document.getElementById('setModel');
+const modalClose    = document.getElementById('modalClose');
+const modalCancel   = document.getElementById('modalCancel');
+const modalSave     = document.getElementById('modalSave');
+const setBaseUrl    = document.getElementById('setBaseUrl');
+const setApiKey     = document.getElementById('setApiKey');
+const setModel      = document.getElementById('setModel');
 
 // ====== 状态 ======
 let selectedFile = null;
 let conversationHistory = [];
 let scriptContext = '';
+let isConnected = false;
 
 // API 设置（从 localStorage 加载，运行时覆盖 config.py 的默认值）
 let apiSettings = {
@@ -43,6 +51,7 @@ let apiSettings = {
 document.addEventListener('DOMContentLoaded', () => {
     loadSettings();
     bindEvents();
+    checkHealth();
 });
 
 function bindEvents() {
@@ -54,6 +63,7 @@ function bindEvents() {
     settingsModal.addEventListener('click', (e) => {
         if (e.target === settingsModal) closeSettings();
     });
+
     // 文件选择
     fileInput.addEventListener('change', handleFileSelect);
     fileBtn.addEventListener('click', () => fileInput.click());
@@ -68,8 +78,11 @@ function bindEvents() {
         }
     });
 
-    // 文本框自动调整高度
-    textInput.addEventListener('input', autoResizeTextarea);
+    // 文本框自动调整高度 + 字数统计
+    textInput.addEventListener('input', () => {
+        autoResizeTextarea();
+        updateCharCount();
+    });
 
     // 拖拽上传
     document.addEventListener('dragover', (e) => {
@@ -84,6 +97,51 @@ function bindEvents() {
             setFile(files[0]);
         }
     });
+}
+
+// ====== 健康检查 ======
+
+async function checkHealth() {
+    try {
+        const res = await fetch('/api/v1/health');
+        if (res.ok) {
+            const data = await res.json();
+            setConnectionStatus(true, `已连接 · ${data.model || ''}`);
+        } else {
+            setConnectionStatus(false, '连接失败');
+        }
+    } catch (_) {
+        setConnectionStatus(false, '无法连接');
+    }
+}
+
+function setConnectionStatus(connected, text) {
+    isConnected = connected;
+    statusDot.classList.toggle('connected', connected);
+    statusDot.classList.toggle('error', !connected);
+    statusText.textContent = text;
+}
+
+// ====== Toast 通知系统 ======
+
+function showToast(message, type = 'info', duration = 3000) {
+    const id = 'toast-' + Date.now();
+    const iconMap = {
+        success: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>',
+        error: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>',
+        info: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>',
+    };
+    const icon = iconMap[type] || iconMap.info;
+    const html = `<div class="toast toast-${type}" id="${id}"><div class="toast-icon">${icon}</div><span>${escapeHtml(message)}</span></div>`;
+    toastContainer.insertAdjacentHTML('beforeend', html);
+
+    setTimeout(() => {
+        const el = document.getElementById(id);
+        if (el) {
+            el.classList.add('toast-exit');
+            setTimeout(() => el.remove(), 300);
+        }
+    }, duration);
 }
 
 // ====== API 设置管理 ======
@@ -116,6 +174,8 @@ function saveSettings() {
     };
     localStorage.setItem('novel2script_settings', JSON.stringify(apiSettings));
     closeSettings();
+    showToast('设置已保存', 'success');
+    checkHealth();
 }
 
 function getApiParams() {
@@ -126,7 +186,17 @@ function getApiParams() {
     };
 }
 
+// ====== 字数统计 ======
+
+function updateCharCount() {
+    const len = textInput.value.length;
+    charCount.textContent = `${len} / 2000`;
+    charCount.classList.toggle('warning', len > 1800 && len <= 2000);
+    charCount.classList.toggle('danger', len > 2000);
+}
+
 // ====== 文件选择 ======
+
 function handleFileSelect(e) {
     const file = e.target.files[0];
     if (file) setFile(file);
@@ -134,7 +204,7 @@ function handleFileSelect(e) {
 
 function setFile(file) {
     if (!file.name.toLowerCase().endsWith('.txt')) {
-        alert('请选择 .txt 文件');
+        showToast('请选择 .txt 文件', 'error');
         return;
     }
     selectedFile = file;
@@ -151,6 +221,7 @@ function clearFile() {
 }
 
 // ====== 发送 ======
+
 async function handleSend() {
     const text = textInput.value.trim();
     const hasFile = !!selectedFile;
@@ -169,7 +240,7 @@ async function handleSend() {
     }
 
     // 显示用户消息
-    const userMsgId = addUserMessage(displayText, hasFile);
+    addUserMessage(displayText, hasFile);
     scrollToBottom();
 
     // 禁用输入
@@ -200,31 +271,25 @@ async function handleSend() {
                 const err = await res.json();
                 const detail = err.error || err.detail || `HTTP ${res.status}`;
                 addAiError(detail, showThinking.checked ? JSON.stringify(err, null, 2) : null);
+                showToast('转换失败', 'error');
             } else {
                 const data = await res.json();
-                // 存储剧本上下文供后续对话使用
                 scriptContext = JSON.stringify({
                     title: data.title,
                     scenes: data.scenes,
                     characters: data.characters,
                 }, null, 2);
-                // 将文件+结果加入对话历史
-                conversationHistory.push({
-                    role: 'user',
-                    content: displayText,
-                });
+                conversationHistory.push({ role: 'user', content: displayText });
                 conversationHistory.push({
                     role: 'assistant',
                     content: `已生成剧本初稿「${data.title}」：${data.scene_count}场戏，${data.character_count}个角色。`,
                 });
                 addAiScript(data, showThinking.checked);
+                showToast('剧本生成成功', 'success');
             }
         } else {
             // --- 文本模式：调用 /api/v1/chat (SSE 流式) ---
-            conversationHistory.push({
-                role: 'user',
-                content: text,
-            });
+            conversationHistory.push({ role: 'user', content: text });
 
             const res = await fetch('/api/v1/chat', {
                 method: 'POST',
@@ -244,6 +309,7 @@ async function handleSend() {
                 const detail = err.error || err.detail || `HTTP ${res.status}`;
                 conversationHistory.pop();
                 addAiError(detail, showThinking.checked ? JSON.stringify(err, null, 2) : null);
+                showToast('请求失败', 'error');
             } else {
                 // 流式读取 SSE 事件流
                 const streamingId = addAiStreaming(showThinking.checked ? '思考' : null);
@@ -252,13 +318,15 @@ async function handleSend() {
                 let fullContent = '';
                 let fullReasoning = '';
                 let readerDone = false;
+                let buffer = '';
 
                 while (!readerDone) {
                     const { done, value } = await reader.read();
                     readerDone = done;
                     if (value) {
-                        const chunk = decoder.decode(value, { stream: !done });
-                        const lines = chunk.split('\n');
+                        buffer += decoder.decode(value, { stream: !done });
+                        const lines = buffer.split('\n');
+                        buffer = lines.pop() || '';
                         for (const line of lines) {
                             if (line.startsWith('data: ')) {
                                 const payload = line.slice(6);
@@ -274,6 +342,7 @@ async function handleSend() {
                                     } else if (parsed.error) {
                                         conversationHistory.pop();
                                         addAiError(parsed.error, null);
+                                        showToast(parsed.error, 'error');
                                     }
                                 } catch (_) { /* 忽略不完整的 JSON 行 */ }
                             }
@@ -282,15 +351,13 @@ async function handleSend() {
                 }
 
                 finalizeAiStreaming(streamingId);
-                conversationHistory.push({
-                    role: 'assistant',
-                    content: fullContent,
-                });
+                conversationHistory.push({ role: 'assistant', content: fullContent });
             }
         }
     } catch (err) {
         removeMessage(aiMsgId);
         addAiError(`网络错误: ${err.message}`, null);
+        showToast('网络错误', 'error');
     }
 
     scrollToBottom();
@@ -299,6 +366,7 @@ async function handleSend() {
     // 重置状态
     textInput.value = '';
     autoResizeTextarea();
+    updateCharCount();
     clearFile();
     textInput.focus();
 }
@@ -314,6 +382,7 @@ function setSending(sending) {
 }
 
 // ====== 文本框自适应高度 ======
+
 function autoResizeTextarea() {
     textInput.style.height = 'auto';
     textInput.style.height = Math.min(textInput.scrollHeight, 120) + 'px';
@@ -321,10 +390,18 @@ function autoResizeTextarea() {
 
 // ====== 消息渲染 ======
 
+function formatTime() {
+    const now = new Date();
+    const h = String(now.getHours()).padStart(2, '0');
+    const m = String(now.getMinutes()).padStart(2, '0');
+    return `${h}:${m}`;
+}
+
 function addUserMessage(text, isFile) {
     const id = 'msg-' + Date.now();
     const html = `
         <div class="message user" id="${id}">
+            <div class="message-time">${formatTime()}</div>
             <div style="flex:1;"></div>
             <div class="message-body">
                 <div class="bubble">${escapeHtml(text)}</div>
@@ -346,20 +423,6 @@ function addAiLoading() {
                         <span></span><span></span><span></span>
                     </div>
                 </div>
-            </div>
-        </div>`;
-    chatArea.insertAdjacentHTML('beforeend', html);
-    return id;
-}
-
-/** 纯文本 AI 回复（非流式回退） */
-function addAiText(text) {
-    const id = 'msg-' + Date.now();
-    const html = `
-        <div class="message ai" id="${id}">
-            <div class="message-avatar">AI</div>
-            <div class="message-body">
-                <div class="bubble">${escapeHtml(text)}</div>
             </div>
         </div>`;
     chatArea.insertAdjacentHTML('beforeend', html);
@@ -396,6 +459,7 @@ function addAiScript(data, showRaw) {
 
     const html = `
         <div class="message ai" id="${id}">
+            <div class="message-time">${formatTime()}</div>
             <div class="message-avatar">AI</div>
             <div class="message-body">
                 ${thinkingHtml}
@@ -425,6 +489,7 @@ function addAiError(detail, rawText) {
     const thinkingHtml = rawText ? thinkingBoxHtml(id, '原始响应', rawText) : '';
     const html = `
         <div class="message ai" id="${id}">
+            <div class="message-time">${formatTime()}</div>
             <div class="message-avatar">AI</div>
             <div class="message-body">
                 ${thinkingHtml}
@@ -443,6 +508,7 @@ function addAiStreaming(thinkingLabel) {
     const thinkingHtml = thinkingLabel ? thinkingBoxHtml(id, thinkingLabel, '') : '';
     const html = `
         <div class="message ai" id="${id}">
+            <div class="message-time">${formatTime()}</div>
             <div class="message-avatar">AI</div>
             <div class="message-body">
                 ${thinkingHtml}
@@ -499,6 +565,7 @@ function removeMessage(id) {
 }
 
 // ====== 工具函数 ======
+
 function scrollToBottom() {
     requestAnimationFrame(() => {
         chatArea.scrollTop = chatArea.scrollHeight;

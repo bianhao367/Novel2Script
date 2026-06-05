@@ -10,3 +10,6 @@ __pycache__/
 
 # 生成输出
 output/
+
+# IDE 配置
+.idea/
