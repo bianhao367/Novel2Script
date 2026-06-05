@@ -16,12 +16,34 @@ pip install -r requirements.txt
 python main.py data/sample_novel.txt
 ```
 
+## HTTP API
+
+```bash
+# 启动服务
+python server.py
+# 服务运行在 http://localhost:8000
+# 交互式文档: http://localhost:8000/docs
+```
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/v1/health` | GET | 健康检查，返回模型和 API 地址 |
+| `/api/v1/convert` | POST | 上传 .txt 文件，返回剧本 JSON |
+| `/api/v1/schema` | GET | 返回剧本 JSON Schema |
+
+```bash
+# 命令行调用示例
+curl -X POST http://localhost:8000/api/v1/convert \
+  -F "file=@data/sample_novel.txt"
+```
+
 ## 项目结构
 
 ```
 ├── .env                      # API 凭据（敏感，已 gitignore）
 ├── config.py                 # 运行参数（model, temperature 等）
-├── main.py                   # 入口脚本
+├── server.py                 # FastAPI HTTP 服务
+├── main.py                   # 命令行入口
 ├── requirements.txt
 ├── data/                     # 小说输入
 │   └── sample_novel.txt
