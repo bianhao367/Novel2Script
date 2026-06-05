@@ -1,0 +1,91 @@
+"""YAML 解析与校验 —— 解析 LLM 返回的 YAML 并用 Pydantic 模型校验。"""
+
+import yaml
+
+from pydantic import BaseModel, Field, ValidationError
+
+
+# --- Pydantic 模型定义剧本结构 ---
+
+class Dialogue(BaseModel):
+    """单句对白"""
+    character: str
+    line: str
+    action: str = ""
+
+
+class Scene(BaseModel):
+    """单场戏"""
+    scene_number: int
+    setting: str = ""
+    characters_present: list[str] = Field(default_factory=list)
+    dialogues: list[Dialogue] = Field(default_factory=list)
+    stage_directions: str = ""
+
+
+class Act(BaseModel):
+    """一幕（包含多场）"""
+    act_number: int
+    scenes: list[Scene] = Field(default_factory=list)
+
+
+class CharacterInfo(BaseModel):
+    """角色信息"""
+    name: str
+    description: str = ""
+
+
+class Script(BaseModel):
+    """完整剧本"""
+    title: str = "Untitled"
+    acts: list[Act] = Field(default_factory=list)
+    characters: list[CharacterInfo] = Field(default_factory=list)
+
+
+# 导出 Schema 类供 schema_gen 使用
+SCRIPT_SCHEMA = Script
+
+
+def parse_yaml(yaml_text: str) -> Script:
+    """解析 YAML 文本并校验是否符合 Script 模型。
+
+    如果 LLM 输出包含了 markdown 代码块标记（```），会自动去除。
+
+    Raises:
+        ValueError: YAML 格式非法或数据不符合模型约束。
+    """
+    cleaned = yaml_text.strip()
+
+    # 去掉可能的 markdown 代码块标记
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+
+    try:
+        raw = yaml.safe_load(cleaned)
+    except yaml.YAMLError as e:
+        raise ValueError(f"YAML 格式错误: {e}") from e
+
+    if raw is None:
+        raise ValueError("解析后的 YAML 为空")
+
+    try:
+        script = Script(**raw)
+    except ValidationError as e:
+        raise ValueError(f"Schema 校验失败:\n{e}") from e
+
+    return script
+
+
+def script_to_yaml(script: Script) -> str:
+    """将校验后的 Script 对象序列化为格式化的 YAML 字符串。"""
+    return yaml.dump(
+        script.model_dump(),
+        allow_unicode=True,
+        default_flow_style=False,
+        sort_keys=False,
+    )

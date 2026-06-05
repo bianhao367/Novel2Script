@@ -1,0 +1,12 @@
+# Config (contains API keys)
+.config
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+
+# Output
+output/
