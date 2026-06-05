@@ -1,0 +1,177 @@
+"""Novel2Script API —— 将小说 .txt 文件转换为结构化剧本的 HTTP 服务。"""
+
+import tempfile
+import traceback
+from pathlib import Path
+
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from src.config import Config, ApiConfig, PipelineConfig, load_config
+from src.llm_client import LLMError, LLMClient
+from src.parser import SCRIPT_SCHEMA
+from src.pipeline import Pipeline
+
+app = FastAPI(
+    title="Novel2Script",
+    description="将小说文本转换为结构化剧本",
+    version="0.1.0",
+)
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+
+
+# --- 请求模型 ---
+
+class ChatRequest(BaseModel):
+    messages: list[dict]
+    script_context: str = ""
+    model: str = ""
+    base_url: str = ""
+    api_key: str = ""
+
+
+# --- 工具 ---
+
+def _apply_settings(base: Config, model: str, base_url: str, api_key: str) -> Config:
+    """用用户提供的值覆盖默认配置。"""
+    if model:
+        base.model = model
+    if base_url:
+        base.api.base_url = base_url
+    if api_key:
+        base.api.api_key = api_key
+    return base
+
+
+# --- 响应模型 ---
+
+def _script_to_response(script, novel_name: str) -> dict:
+    scenes_summary = []
+    for s in script.scenes:
+        dialogue_count = sum(1 for c in s.content if c.type == "dialogue")
+        action_count = sum(1 for c in s.content if c.type == "action")
+        scenes_summary.append({
+            "scene_number": s.scene_number,
+            "slugline": s.slugline,
+            "dialogue_count": dialogue_count,
+            "action_count": action_count,
+        })
+
+    return {
+        "novel_name": novel_name,
+        "title": script.title,
+        "scene_count": len(script.scenes),
+        "character_count": len(script.characters),
+        "scenes": scenes_summary,
+        "characters": [
+            {"name": c.name, "description": c.description}
+            for c in script.characters
+        ],
+        "script": script.model_dump(),
+    }
+
+
+# --- 前端入口 ---
+
+@app.get("/")
+def index():
+    return FileResponse("static/index.html")
+
+
+# --- 端点 ---
+
+@app.get("/api/v1/health")
+def health():
+    config = load_config()
+    return {
+        "status": "ok",
+        "model": config.model,
+        "base_url": config.api.base_url,
+    }
+
+
+@app.post("/api/v1/convert")
+def convert(
+    file: UploadFile = File(...),
+    model: str = Form(""),
+    base_url: str = Form(""),
+    api_key: str = Form(""),
+):
+    """上传小说 .txt 文件，返回转换后的剧本。"""
+    if not file.filename or not file.filename.lower().endswith(".txt"):
+        raise HTTPException(status_code=400, detail="只接受 .txt 文件")
+
+    content = file.file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail=f"文件过大，上限 {MAX_FILE_SIZE // 1024 // 1024} MB")
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="文件为空")
+
+    novel_name = Path(file.filename).stem
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=".txt", delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        config = _apply_settings(load_config(), model, base_url, api_key)
+        pipeline = Pipeline(config)
+        script = pipeline.run(tmp_path)
+        return _script_to_response(script, novel_name)
+    except LLMError as e:
+        raise HTTPException(status_code=502, detail=f"LLM 调用失败: {e}")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"服务器内部错误: {e}")
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+@app.post("/api/v1/chat")
+def chat(req: ChatRequest):
+    """常规 AI 对话。"""
+    config = _apply_settings(load_config(), req.model, req.base_url, req.api_key)
+    llm = LLMClient(config)
+
+    system_msg = "你是一个专业的编剧助手。你可以帮助用户打磨剧本、修改对白、调整情节结构。请用中文回答。"
+    if req.script_context:
+        system_msg += f"\n\n当前剧本上下文：\n{req.script_context}"
+
+    messages = [{"role": "system", "content": system_msg}] + req.messages
+
+    try:
+        reply = llm.chat(messages)
+        return {"reply": reply}
+    except LLMError as e:
+        raise HTTPException(status_code=502, detail=f"LLM 调用失败: {e}")
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"服务器内部错误: {e}")
+
+
+@app.get("/api/v1/schema")
+def get_schema():
+    return SCRIPT_SCHEMA.model_json_schema()
+
+
+# --- 全局异常处理 ---
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.detail},
+    )
+
+
+# --- 启动入口 ---
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
