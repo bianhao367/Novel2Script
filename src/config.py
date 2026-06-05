@@ -27,9 +27,16 @@ class PipelineConfig:
 
 
 @dataclass
+class RedisConfig:
+    url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    enabled: bool = os.getenv("REDIS_ENABLED", "true").lower() == "true"
+
+
+@dataclass
 class Config:
     api: ApiConfig = field(default_factory=ApiConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
+    redis: RedisConfig = field(default_factory=RedisConfig)
     # 额外存储原始读取值供参考
     model: str = ""
     temperature: float = 0.7

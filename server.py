@@ -3,17 +3,21 @@
 import json
 import tempfile
 import traceback
+import uuid
 from pathlib import Path
 
+import redis as redis_lib
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from rq import Queue
 
 from src.config import Config, ApiConfig, PipelineConfig, load_config
 from src.llm_client import LLMError, LLMClient
 from src.parser import SCRIPT_SCHEMA
 from src.pipeline import Pipeline
+from src.response import script_to_response
 
 app = FastAPI(
     title="Novel2Script",
@@ -53,29 +57,22 @@ def _apply_settings(base: Config, model: str, base_url: str, api_key: str) -> Co
 # --- 响应模型 ---
 
 def _script_to_response(script, novel_name: str) -> dict:
-    scenes_summary = []
-    for s in script.scenes:
-        dialogue_count = sum(1 for c in s.content if c.type == "dialogue")
-        action_count = sum(1 for c in s.content if c.type == "action")
-        scenes_summary.append({
-            "scene_number": s.scene_number,
-            "slugline": s.slugline,
-            "dialogue_count": dialogue_count,
-            "action_count": action_count,
-        })
+    return script_to_response(script, novel_name)
 
-    return {
-        "novel_name": novel_name,
-        "title": script.title,
-        "scene_count": len(script.scenes),
-        "character_count": len(script.characters),
-        "scenes": scenes_summary,
-        "characters": [
-            {"name": c.name, "description": c.description}
-            for c in script.characters
-        ],
-        "script": script.model_dump(),
-    }
+
+# --- Redis 辅助 ---
+
+def _get_redis():
+    """返回 Redis 连接，不可用时返回 None。"""
+    config = load_config()
+    if not config.redis.enabled:
+        return None
+    try:
+        r = redis_lib.Redis.from_url(config.redis.url)
+        r.ping()
+        return r
+    except Exception:
+        return None
 
 
 # --- 前端入口 ---
@@ -133,6 +130,84 @@ def convert(
         raise HTTPException(status_code=500, detail=f"服务器内部错误: {e}")
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+
+
+@app.post("/api/v1/convert/async")
+def convert_async(
+    file: UploadFile = File(...),
+    model: str = Form(""),
+    base_url: str = Form(""),
+    api_key: str = Form(""),
+):
+    """异步转换：提交任务到 rq 队列，立即返回 task_id。"""
+    r = _get_redis()
+    if r is None:
+        raise HTTPException(status_code=503, detail="Redis 不可用，请使用 /api/v1/convert 同步模式")
+
+    if not file.filename or not file.filename.lower().endswith(".txt"):
+        raise HTTPException(status_code=400, detail="只接受 .txt 文件")
+
+    content = file.file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail=f"文件过大，上限 {MAX_FILE_SIZE // 1024 // 1024} MB")
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="文件为空")
+
+    novel_name = Path(file.filename).stem
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=".txt", delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    task_id = str(uuid.uuid4())
+
+    r.hset(f"task:{task_id}", mapping={
+        "status": "queued",
+        "step": "queued",
+        "percent": "0",
+        "novel_name": novel_name,
+    })
+    r.expire(f"task:{task_id}", 3600)
+
+    q = Queue(connection=r)
+    q.enqueue(
+        "worker.run_conversion",
+        task_id, tmp_path, model, base_url, api_key,
+        job_id=task_id,
+        job_timeout="10m",
+    )
+
+    return {"task_id": task_id, "novel_name": novel_name}
+
+
+@app.get("/api/v1/tasks/{task_id}")
+def get_task_status(task_id: str):
+    """查询异步转换任务的进度和结果。"""
+    r = _get_redis()
+    if r is None:
+        raise HTTPException(status_code=503, detail="Redis 不可用")
+
+    key = f"task:{task_id}"
+    data = r.hgetall(key)
+    if not data:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    info = {k.decode(): v.decode() for k, v in data.items()}
+    status = info.get("status", "unknown")
+
+    response = {
+        "task_id": task_id,
+        "status": status,
+        "step": info.get("step", ""),
+        "percent": int(info.get("percent", 0)),
+        "novel_name": info.get("novel_name", ""),
+    }
+
+    if status == "done" and "result" in info:
+        response["result"] = json.loads(info["result"])
+    elif status == "failed":
+        response["error"] = info.get("error", "Unknown error")
+
+    return response
 
 
 @app.post("/api/v1/chat")

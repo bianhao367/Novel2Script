@@ -252,7 +252,7 @@ async function handleSend() {
 
     try {
         if (hasFile) {
-            // --- 文件模式：调用 /api/v1/convert ---
+            // --- 文件模式：优先异步，Redis 不可用时降级同步 ---
             const formData = new FormData();
             formData.append('file', selectedFile);
             const api = getApiParams();
@@ -260,20 +260,10 @@ async function handleSend() {
             if (api.base_url) formData.append('base_url', api.base_url);
             if (api.api_key) formData.append('api_key', api.api_key);
 
-            const res = await fetch('/api/v1/convert', {
-                method: 'POST',
-                body: formData,
-            });
-
             removeMessage(aiMsgId);
 
-            if (!res.ok) {
-                const err = await res.json();
-                const detail = err.error || err.detail || `HTTP ${res.status}`;
-                addAiError(detail, showThinking.checked ? JSON.stringify(err, null, 2) : null);
-                showToast('转换失败', 'error');
-            } else {
-                const data = await res.json();
+            try {
+                const data = await convertAsync(formData);
                 scriptContext = JSON.stringify({
                     title: data.title,
                     scenes: data.scenes,
@@ -286,6 +276,9 @@ async function handleSend() {
                 });
                 addAiScript(data, showThinking.checked);
                 showToast('剧本生成成功', 'success');
+            } catch (e) {
+                addAiError(e.message, null);
+                showToast('转换失败', 'error');
             }
         } else {
             // --- 文本模式：调用 /api/v1/chat (SSE 流式) ---
@@ -369,6 +362,64 @@ async function handleSend() {
     updateCharCount();
     clearFile();
     textInput.focus();
+}
+
+// ====== 异步转换（提交→轮询） ======
+
+async function convertAsync(formData) {
+    // 先尝试异步模式
+    const submitRes = await fetch('/api/v1/convert/async', {
+        method: 'POST',
+        body: formData,
+    });
+
+    if (!submitRes.ok) {
+        // 503 = Redis 不可用，降级到同步模式
+        if (submitRes.status === 503) {
+            return await convertSync(formData);
+        }
+        const err = await submitRes.json();
+        throw new Error(err.detail || err.error || `HTTP ${submitRes.status}`);
+    }
+
+    const { task_id, novel_name } = await submitRes.json();
+    const progressId = addAiProgress(`正在转换: ${novel_name}`);
+
+    while (true) {
+        await sleep(2000);
+        const pollRes = await fetch(`/api/v1/tasks/${task_id}`);
+        if (!pollRes.ok) {
+            removeMessage(progressId);
+            throw new Error(`轮询失败: HTTP ${pollRes.status}`);
+        }
+        const task = await pollRes.json();
+        updateAiProgress(progressId, task.step, task.percent);
+
+        if (task.status === 'done') {
+            removeMessage(progressId);
+            return task.result;
+        }
+        if (task.status === 'failed') {
+            removeMessage(progressId);
+            throw new Error(task.error || '转换失败');
+        }
+    }
+}
+
+async function convertSync(formData) {
+    const res = await fetch('/api/v1/convert', {
+        method: 'POST',
+        body: formData,
+    });
+    if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || err.error || `HTTP ${res.status}`);
+    }
+    return await res.json();
+}
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function setSending(sending) {
@@ -557,6 +608,50 @@ function thinkingBoxHtml(id, label, content) {
         </div>
         <div class="thinking-body${openClass}" id="${id}-thinking-body">${content ? escapeHtml(content) : ''}</div>
     </div>`;
+}
+
+/** 进度条消息气泡 */
+function addAiProgress(label) {
+    const id = 'msg-progress-' + Date.now();
+    const html = `
+        <div class="message ai" id="${id}">
+            <div class="message-avatar">AI</div>
+            <div class="message-body">
+                <div class="bubble">
+                    <div class="progress-container">
+                        <div class="progress-label">${escapeHtml(label)}</div>
+                        <div class="progress-bar-track">
+                            <div class="progress-bar-fill" id="${id}-fill" style="width: 0%"></div>
+                        </div>
+                        <div class="progress-step" id="${id}-step">准备中...</div>
+                    </div>
+                </div>
+            </div>
+        </div>`;
+    chatArea.insertAdjacentHTML('beforeend', html);
+    scrollToBottom();
+    return id;
+}
+
+function updateAiProgress(msgId, step, percent) {
+    const fill = document.getElementById(msgId + '-fill');
+    const stepEl = document.getElementById(msgId + '-step');
+    if (fill) fill.style.width = percent + '%';
+    if (stepEl) {
+        const stepLabels = {
+            queued: '排队中...',
+            reading: '读取小说...',
+            chunking: '分块处理...',
+            prompting: '构建 Prompt...',
+            calling_llm: '调用 LLM（可能需要 10-60 秒）...',
+            llm_complete: 'LLM 响应完成...',
+            parsing: '解析校验...',
+            saving: '保存剧本...',
+            done: '完成!',
+        };
+        stepEl.textContent = stepLabels[step] || step;
+    }
+    scrollToBottom();
 }
 
 function removeMessage(id) {
