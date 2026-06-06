@@ -83,6 +83,26 @@ class MemoryUpdate(BaseModel):
     event_summary: str = ""
 
 
+class ReviewResult(BaseModel):
+    """审查 Agent 的输出结构"""
+    valid: bool = True
+    issues: list[str] = Field(default_factory=list)
+    suggestions: str = ""
+
+
+def _strip_code_fences(text: str) -> str:
+    """去除 LLM 输出中可能包含的 markdown 代码块标记。"""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    return cleaned
+
+
 def parse_yaml(yaml_text: str) -> Script:
     """解析 YAML 文本并校验是否符合 Script 模型。
 
@@ -91,16 +111,7 @@ def parse_yaml(yaml_text: str) -> Script:
     Raises:
         ValueError: YAML 格式非法或数据不符合模型约束。
     """
-    cleaned = yaml_text.strip()
-
-    # 去掉可能的 markdown 代码块标记
-    if cleaned.startswith("```"):
-        lines = cleaned.split("\n")
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        cleaned = "\n".join(lines).strip()
+    cleaned = _strip_code_fences(yaml_text)
 
     try:
         raw = yaml.safe_load(cleaned)
@@ -129,19 +140,8 @@ def script_to_yaml(script: Script) -> str:
 
 
 def parse_memory_update(yaml_text: str) -> MemoryUpdate:
-    """解析记忆更新 LLM 输出的 YAML。
-
-    与 parse_yaml 类似的清理逻辑：去除 markdown 代码块标记。
-    """
-    cleaned = yaml_text.strip()
-
-    if cleaned.startswith("```"):
-        lines = cleaned.split("\n")
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        cleaned = "\n".join(lines).strip()
+    """解析记忆更新 LLM 输出的 YAML。"""
+    cleaned = _strip_code_fences(yaml_text)
 
     try:
         raw = yaml.safe_load(cleaned)
@@ -155,6 +155,24 @@ def parse_memory_update(yaml_text: str) -> MemoryUpdate:
         return MemoryUpdate(**raw)
     except ValidationError as e:
         raise ValueError(f"记忆更新 Schema 校验失败:\n{e}") from e
+
+
+def parse_review_result(yaml_text: str) -> ReviewResult:
+    """解析审查 Agent 输出的 YAML。"""
+    cleaned = _strip_code_fences(yaml_text)
+
+    try:
+        raw = yaml.safe_load(cleaned)
+    except yaml.YAMLError as e:
+        raise ValueError(f"审查结果 YAML 格式错误: {e}") from e
+
+    if raw is None:
+        raise ValueError("审查结果 YAML 为空")
+
+    try:
+        return ReviewResult(**raw)
+    except ValidationError as e:
+        raise ValueError(f"审查结果 Schema 校验失败:\n{e}") from e
 
 
 def merge_scripts(scripts: list[Script]) -> Script:
@@ -197,7 +215,11 @@ def compress_event_memory(event_summaries: list[str], max_chars: int) -> str:
     """当事件记忆超过 max_chars 时，保留最近的摘要，丢弃最早的。
 
     策略：从最新往回累加，超限时截断并加省略标注。
+    如果最新的一条摘要本身就超限，则截断该条至 max_chars。
     """
+    if not event_summaries:
+        return ""
+
     full_text = "\n".join(event_summaries)
     if len(full_text) <= max_chars:
         return full_text
@@ -209,6 +231,9 @@ def compress_event_memory(event_summaries: list[str], max_chars: int) -> str:
 
     for summary in reversed(event_summaries):
         if total + len(summary) + 1 > budget:
+            if not kept:
+                # 最新一条本身就超限，截断保留
+                kept.insert(0, summary[:budget])
             break
         kept.insert(0, summary)
         total += len(summary) + 1

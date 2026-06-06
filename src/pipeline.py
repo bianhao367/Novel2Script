@@ -24,9 +24,10 @@ from src.config import Config, load_config
 from src.llm_client import LLMClient
 from src.parser import (
     Script, parse_yaml, script_to_yaml,
-    parse_memory_update, merge_scripts, compress_event_memory,
+    parse_memory_update, parse_review_result,
+    merge_scripts, compress_event_memory,
 )
-from src.prompt import build_memory_prompt, build_memory_update_prompt
+from src.prompt import build_memory_prompt, build_memory_update_prompt, build_review_prompt
 from src.reader import NovelReader
 from src.schema_gen import generate_json_schema, generate_markdown_doc
 
@@ -101,7 +102,7 @@ class Pipeline:
             raw_path.write_text(raw_output, encoding="utf-8")
 
             # YAML 解析 + 重试
-            self._progress("parsing", base_pct + 4)
+            self._progress("parsing", base_pct + 3)
             try:
                 script_fragment = parse_yaml(raw_output)
             except ValueError as parse_err:
@@ -117,6 +118,47 @@ class Pipeline:
                 raw_path.write_text(raw_output, encoding="utf-8")
                 script_fragment = parse_yaml(raw_output)
 
+            # ---- LLM Call 2: 审查剧本片段 ----
+            self._progress("reviewing", base_pct + 5)
+            review_messages = build_review_prompt(
+                script_fragment_yaml=raw_output,
+                current_characters=character_registry,
+                start_scene_number=next_scene_number,
+            )
+            review_raw = self.llm.chat(review_messages)
+
+            try:
+                review_result = parse_review_result(review_raw)
+            except ValueError as rev_err:
+                print(f"  块 {chunk_idx} 审查结果解析失败（跳过）: {rev_err}")
+                review_result = None
+
+            if review_result and not review_result.valid:
+                # 审查不通过，带修正建议重试一次
+                print(f"  块 {chunk_idx} 审查不通过: {review_result.issues}")
+                raw_output_before_review = raw_output  # 保存原始输出，重试失败时还原
+                script_fragment_before_review = script_fragment
+
+                fix_messages = messages + [
+                    {"role": "assistant", "content": raw_output},
+                    {"role": "user", "content": (
+                        f"审查发现问题：\n{chr(10).join('- ' + i for i in review_result.issues)}\n\n"
+                        f"修正建议：{review_result.suggestions}\n\n"
+                        "请根据以上问题重新输出修正后的完整 YAML，不要添加额外文字。"
+                    )},
+                ]
+                retry_output = self.llm.chat(fix_messages)
+
+                try:
+                    script_fragment = parse_yaml(retry_output)
+                    raw_output = retry_output
+                    raw_path.write_text(raw_output, encoding="utf-8")
+                    print(f"  块 {chunk_idx} 修正后重新解析成功")
+                except ValueError as e:
+                    print(f"  块 {chunk_idx} 修正后仍解析失败，使用原始结果: {e}")
+                    raw_output = raw_output_before_review
+                    script_fragment = script_fragment_before_review
+
             # 更新场景编号
             if script_fragment.scenes:
                 next_scene_number = max(s.scene_number for s in script_fragment.scenes) + 1
@@ -125,8 +167,8 @@ class Pipeline:
             print(f"  块 {chunk_idx} 剧本: {len(script_fragment.scenes)} 场, "
                   f"{len(script_fragment.characters)} 角色")
 
-            # ---- LLM Call 2: 更新记忆 ----
-            self._progress("updating_memory", base_pct + 6)
+            # ---- LLM Call 3: 更新记忆 ----
+            self._progress("updating_memory", base_pct + 7)
             memory_messages = build_memory_update_prompt(
                 script_fragment_yaml=raw_output,
                 current_characters=character_registry,

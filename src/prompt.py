@@ -208,3 +208,64 @@ def build_memory_update_prompt(
             "content": f"以下是本片段生成的剧本 YAML：\n\n{script_fragment_yaml}",
         },
     ]
+
+
+# --- 审查 Agent Prompt ---
+
+REVIEW_PROMPT = """\
+你是一名剧本审查员。请检查以下剧本片段是否符合规范。
+
+**角色注册表（已知角色）：**
+{current_characters}
+
+**场景编号要求：** 本块的 scene_number 必须从 {start_scene_number} 开始。
+
+**检查规则：**
+1. scene_number 是否从 {start_scene_number} 开始递增
+2. 所有 dialogue 中的 character 名是否出现在 characters 列表中
+3. 角色名是否与注册表中的已有角色名保持一致（不要出现"叶凡"和"叶同学"等不一致写法）
+4. content 列表中 action 和 dialogue 是否合理交替
+5. 是否有明显的剧情逻辑问题（如已死亡角色复活、场景地点矛盾等）
+
+请输出合法的 YAML，格式如下：
+
+```yaml
+valid: true/false
+issues:
+  - "问题描述 1"
+  - "问题描述 2"
+suggestions: "修正建议"
+```
+
+规则：
+- 如果没有问题，valid=true，issues 为空列表，suggestions 留空。
+- 如果有问题，valid=false，列出所有发现的问题，并给出具体修正建议。
+"""
+
+
+def build_review_prompt(
+    script_fragment_yaml: str,
+    current_characters: dict[str, dict],
+    start_scene_number: int,
+) -> list[dict]:
+    """构建审查 Agent 的 prompt。
+
+    Args:
+        script_fragment_yaml: 当前块生成的剧本 YAML 文本
+        current_characters: 当前角色注册表
+        start_scene_number: 本块场景的起始编号
+    """
+    char_text = _format_character_registry(current_characters)
+
+    system_content = REVIEW_PROMPT.format(
+        current_characters=char_text,
+        start_scene_number=start_scene_number,
+    )
+
+    return [
+        {"role": "system", "content": system_content},
+        {
+            "role": "user",
+            "content": f"以下是待审查的剧本片段 YAML：\n\n{script_fragment_yaml}",
+        },
+    ]
