@@ -36,7 +36,6 @@ from src.prompt import (
     build_memory_prompt, build_memory_update_prompt,
     build_review_prompt, build_director_prompt, build_fix_prompt,
     build_orchestrator_prompt, build_dialogue_agent_prompt, build_action_agent_prompt,
-    MEMORY_UPDATE_PROMPT,
 )
 from src.reader import NovelReader
 from src.schema_gen import generate_json_schema, generate_markdown_doc
@@ -102,6 +101,7 @@ class Pipeline:
             self._progress("done", 100)
             return Script()
 
+        chunk_executor = ThreadPoolExecutor(max_workers=2)
         for i, chunk in enumerate(chunks):
             if self._cancel_event and self._cancel_event.is_set():
                 print(f"\n--- 转换已取消（第 {i+1}/{total_chunks} 块前）---")
@@ -141,7 +141,7 @@ class Pipeline:
             print(f"  编排: {len(outline.scenes)} 场, "
                   f"对白段 {len(dialogue_paras)}, 动作段 {len(action_paras)}")
 
-            # ---- Step 2: 并行专家 (对白 + 动作 + 记忆) ----
+            # ---- Step 2: 并行专家 (对白 + 动作) ----
             self._progress("calling_experts", base_pct + 3)
 
             def call_dialogue():
@@ -160,46 +160,20 @@ class Pipeline:
                 )
                 return parse_action_script(self.llm.chat(msgs))
 
-            def call_memory():
-                if character_registry:
-                    char_lines = []
-                    for name, info in character_registry.items():
-                        main_tag = "（主角）" if info.get("is_main") else ""
-                        char_lines.append(f"- {name}{main_tag}: {info.get('description', '')}")
-                    char_text = "\n".join(char_lines)
-                else:
-                    char_text = "（暂无）"
-                system_content = MEMORY_UPDATE_PROMPT.format(current_characters=char_text)
-                memory_msgs = [
-                    {"role": "system", "content": system_content},
-                    {"role": "user", "content": (
-                        "请根据以下小说片段提取角色信息和剧情摘要：\n\n" + chunk
-                    )},
-                ]
-                return parse_memory_update(self.llm.chat(memory_msgs, max_tokens=2048))
+            f_dialogue = chunk_executor.submit(call_dialogue)
+            f_action = chunk_executor.submit(call_action)
 
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                f_dialogue = executor.submit(call_dialogue)
-                f_action = executor.submit(call_action)
-                f_memory = executor.submit(call_memory)
+            try:
+                dialogue_script = f_dialogue.result()
+            except (ValueError, LLMError) as e:
+                print(f"  块 {chunk_idx} 对白专家失败: {e}")
+                dialogue_script = DialogueScript(items=[])
 
-                try:
-                    dialogue_script = f_dialogue.result()
-                except (ValueError, LLMError) as e:
-                    print(f"  块 {chunk_idx} 对白专家失败: {e}")
-                    dialogue_script = DialogueScript(items=[])
-
-                try:
-                    action_script = f_action.result()
-                except (ValueError, LLMError) as e:
-                    print(f"  块 {chunk_idx} 动作专家失败: {e}")
-                    action_script = ActionScript(items=[])
-
-                try:
-                    memory_update = f_memory.result()
-                except (ValueError, LLMError) as e:
-                    print(f"  块 {chunk_idx} 记忆专家失败: {e}")
-                    memory_update = None
+            try:
+                action_script = f_action.result()
+            except (ValueError, LLMError) as e:
+                print(f"  块 {chunk_idx} 动作专家失败: {e}")
+                action_script = ActionScript(items=[])
 
             print(f"  专家结果: 对白 {len(dialogue_script.items)} 条, "
                   f"动作 {len(action_script.items)} 条")
@@ -213,6 +187,14 @@ class Pipeline:
             raw_output = script_to_yaml(script_fragment)
             raw_path = novel_dir / f"raw_chunk_{chunk_idx}.txt"
             raw_path.write_text(raw_output, encoding="utf-8")
+
+            # ---- Step 3.5: 记忆专家 (用剧本 YAML 而非原文) ----
+            try:
+                memory_msgs = build_memory_update_prompt(raw_output, character_registry)
+                memory_update = parse_memory_update(self.llm.chat(memory_msgs, max_tokens=2048))
+            except (ValueError, LLMError) as e:
+                print(f"  块 {chunk_idx} 记忆专家失败: {e}")
+                memory_update = None
 
             # ---- Step 4: 多轮审查闭环 ----
             raw_output_before_review = raw_output
@@ -310,6 +292,8 @@ class Pipeline:
 
                 print(f"  记忆更新: {len(memory_update.characters)} 角色, "
                       f"事件: {memory_update.event_summary[:60]}...")
+
+        chunk_executor.shutdown(wait=True)
 
         # 5. 合并所有块的剧本
         self._progress("merging", 90)
@@ -409,6 +393,7 @@ class Pipeline:
                 done_count += 1
                 pct = 10 + int(25 * done_count / total_dir_chunks)
                 self._progress("directing", pct)
+        results.sort(key=lambda x: x[0])  # 按 chunk_idx 排序，保持叙事顺序
 
         # 合并所有块的结果
         for chunk_idx, analysis in results:

@@ -35,7 +35,6 @@ class ConnectionManager:
         self._task_subs: dict[str, set[str]] = {}       # task_id -> {client_id, ...}
         self._client_tasks: dict[str, set[str]] = {}     # client_id -> {task_id, ...}
         self._pubsub_listeners: dict[str, asyncio.Task] = {}  # task_id -> Task
-        self._task_owners: dict[str, str] = {}           # task_id -> client_id (owner)
         self._lock = asyncio.Lock()
         self._redis: redis_lib.Redis | None = None
         self._redis_initialized = False
@@ -93,15 +92,7 @@ class ConnectionManager:
         if ws:
             await ws.send_json(message)
 
-    def register_task_owner(self, client_id: str, task_id: str):
-        """注册任务的创建者，用于订阅鉴权。"""
-        self._task_owners[task_id] = client_id
-
     async def subscribe_task(self, client_id: str, task_id: str):
-        # 鉴权：如果任务有注册所有者，只允许所有者订阅
-        owner = self._task_owners.get(task_id)
-        if owner is not None and owner != client_id:
-            return
         async with self._lock:
             if task_id not in self._task_subs:
                 self._task_subs[task_id] = set()

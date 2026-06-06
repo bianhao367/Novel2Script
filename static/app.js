@@ -195,6 +195,7 @@ function handleWsMessage(msg) {
         }
 
         case 'task_progress':
+            activeTasks.add(msg.task_id);
             scriptChannel.postMessage({ type: 'progress', step: msg.step, percent: msg.percent });
             break;
 
@@ -213,6 +214,8 @@ function handleWsMessage(msg) {
 
         case 'task_failed': {
             activeTasks.delete(msg.task_id);
+            scriptChannel.postMessage({ type: 'error', error: msg.error || '转换失败' });
+            showToast('转换失败: ' + (msg.error || '未知错误'), 'error');
             const resolver = taskResolvers.get(msg.task_id);
             if (resolver) {
                 resolver.reject(new Error(msg.error || '转换失败'));

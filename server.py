@@ -61,7 +61,6 @@ app = FastAPI(
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
-_output_dir = Path(load_config().pipeline.output_dir)
 
 # WebSocket 连接管理器
 manager = ConnectionManager()
@@ -524,6 +523,7 @@ def convert_async(
                     "percent": 100, "result": result,
                 }, ensure_ascii=False))
             else:
+                _memory_tasks_cleanup()
                 _memory_tasks[task_id] = {
                     "status": "done", "step": "done", "percent": 100,
                     "result": result, "novel_name": novel_name,
@@ -542,6 +542,7 @@ def convert_async(
                     "step": "error", "percent": 0, "error": error_msg,
                 }))
             else:
+                _memory_tasks_cleanup()
                 _memory_tasks[task_id] = {
                     "status": "failed", "step": "error", "percent": 0,
                     "error": error_msg,
@@ -653,7 +654,7 @@ def get_schema():
 def download_script(novel_name: str):
     """下载已生成的 YAML 剧本文件。"""
     safe_name = re.sub(r'[\\/:*?"<>|]', '_', novel_name)[:100]
-    yaml_path = _output_dir / safe_name / f"{safe_name}.yaml"
+    yaml_path = Path(load_config().pipeline.output_dir) / safe_name / f"{safe_name}.yaml"
     if not yaml_path.exists():
         raise HTTPException(status_code=404, detail="剧本文件不存在")
     return FileResponse(
