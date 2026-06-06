@@ -37,7 +37,7 @@ class PipelineConfig:
     overlap_size: int = 500          # 滑动窗口重叠字符数，保证上下文连贯
     event_memory_max_chars: int = 1500  # 事件记忆最大字符数，超过自动压缩
     director_enabled: bool = True    # 是否启用导演 Agent 全局预读
-    director_chunk_size: int = 5000  # 导演预读的分块大小
+    director_chunk_size: int = 15000  # 导演预读的分块大小
     review_max_rounds: int = 3       # 审查最大轮次
 
 

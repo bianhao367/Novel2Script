@@ -96,6 +96,46 @@ class NovelAnalysis(BaseModel):
     plot_events: str = ""
 
 
+# --- 多 Agent 并行专家模型 ---
+
+class ParagraphAssignment(BaseModel):
+    """编排 Agent 输出的段落分类"""
+    para_idx: int                                  # 段落在原文中的序号（从0开始）
+    content_type: Literal["dialogue", "action"]    # 段落类型
+
+class SceneOutline(BaseModel):
+    """编排 Agent 输出的单个场景大纲"""
+    scene_number: int
+    slugline: str = ""
+    paragraphs: list[ParagraphAssignment] = Field(default_factory=list)
+
+class ChunkOutline(BaseModel):
+    """编排 Agent 对一个块的完整分析"""
+    scenes: list[SceneOutline] = Field(default_factory=list)
+
+class DialogueOutputItem(BaseModel):
+    """对白专家的单条输出"""
+    scene_number: int
+    para_idx: int
+    character: str
+    line: str
+    parenthetical: str = ""
+
+class ActionOutputItem(BaseModel):
+    """动作专家的单条输出"""
+    scene_number: int
+    para_idx: int
+    text: str
+
+class DialogueScript(BaseModel):
+    """对白专家的完整输出"""
+    items: list[DialogueOutputItem] = Field(default_factory=list)
+
+class ActionScript(BaseModel):
+    """动作专家的完整输出"""
+    items: list[ActionOutputItem] = Field(default_factory=list)
+
+
 def _strip_code_fences(text: str) -> str:
     """去除 LLM 输出中可能包含的 markdown 代码块标记。"""
     cleaned = text.strip()
@@ -197,6 +237,112 @@ def parse_novel_analysis(yaml_text: str) -> NovelAnalysis:
         return NovelAnalysis(**raw)
     except ValidationError as e:
         raise ValueError(f"导演分析 Schema 校验失败:\n{e}") from e
+
+
+def parse_chunk_outline(yaml_text: str) -> ChunkOutline:
+    """解析编排 Agent 输出的 YAML。"""
+    cleaned = _strip_code_fences(yaml_text)
+
+    try:
+        raw = yaml.safe_load(cleaned)
+    except yaml.YAMLError as e:
+        raise ValueError(f"编排分析 YAML 格式错误: {e}") from e
+
+    if raw is None:
+        raise ValueError("编排分析 YAML 为空")
+
+    try:
+        return ChunkOutline(**raw)
+    except ValidationError as e:
+        raise ValueError(f"编排分析 Schema 校验失败:\n{e}") from e
+
+
+def parse_dialogue_script(yaml_text: str) -> DialogueScript:
+    """解析对白专家输出的 YAML。"""
+    cleaned = _strip_code_fences(yaml_text)
+
+    try:
+        raw = yaml.safe_load(cleaned)
+    except yaml.YAMLError as e:
+        raise ValueError(f"对白 YAML 格式错误: {e}") from e
+
+    if raw is None:
+        raise ValueError("对白 YAML 为空")
+
+    try:
+        return DialogueScript(**raw)
+    except ValidationError as e:
+        raise ValueError(f"对白 Schema 校验失败:\n{e}") from e
+
+
+def parse_action_script(yaml_text: str) -> ActionScript:
+    """解析动作专家输出的 YAML。"""
+    cleaned = _strip_code_fences(yaml_text)
+
+    try:
+        raw = yaml.safe_load(cleaned)
+    except yaml.YAMLError as e:
+        raise ValueError(f"动作 YAML 格式错误: {e}") from e
+
+    if raw is None:
+        raise ValueError("动作 YAML 为空")
+
+    try:
+        return ActionScript(**raw)
+    except ValidationError as e:
+        raise ValueError(f"动作 Schema 校验失败:\n{e}") from e
+
+
+def merge_expert_outputs(
+    outline: ChunkOutline,
+    dialogues: DialogueScript,
+    actions: ActionScript,
+    characters: list[CharacterInfo],
+) -> Script:
+    """将编排、对白、动作专家的输出合并为完整 Script。
+
+    - 按 scene_number 分组
+    - 每场景内将 dialogue 和 action items 按 para_idx 排序
+    - 相同 para_idx 时 dialogue 在前
+    """
+    # 建立 scene_number -> Scene 的映射
+    scene_map: dict[int, Scene] = {}
+    for so in outline.scenes:
+        scene_map[so.scene_number] = Scene(
+            scene_number=so.scene_number,
+            slugline=so.slugline,
+            content=[],
+        )
+
+    # 收集所有 content items 并按 (scene_number, para_idx, priority) 排序
+    # priority: dialogue=0 (在前), action=1 (在后)
+    entries: list[tuple[int, int, int, ContentItem]] = []
+
+    for item in dialogues.items:
+        entries.append((
+            item.scene_number,
+            item.para_idx,
+            0,
+            DialogueItem(type="dialogue", character=item.character, line=item.line, parenthetical=item.parenthetical),
+        ))
+
+    for item in actions.items:
+        entries.append((
+            item.scene_number,
+            item.para_idx,
+            1,
+            ActionItem(type="action", text=item.text),
+        ))
+
+    entries.sort(key=lambda e: (e[0], e[1], e[2]))
+
+    # 分配到各场景
+    for scene_num, _, _, content_item in entries:
+        if scene_num in scene_map:
+            scene_map[scene_num].content.append(content_item)
+
+    scenes = sorted(scene_map.values(), key=lambda s: s.scene_number)
+    return Script(scenes=scenes, characters=characters)
 
 
 def merge_scripts(scripts: list[Script]) -> Script:

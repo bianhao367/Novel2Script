@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>剧本预览 — Novel2Script</title>
+<style>
+:root {
+    --bg: #1a1a2e;
+    --surface: #16213e;
+    --border: #2a2a4a;
+    --text: #e0e0e0;
+    --text-muted: #8888aa;
+    --accent: #7c8cf8;
+    --accent-dim: #5a6ac8;
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+    --mono: 'SF Mono', 'Cascadia Code', 'JetBrains Mono', 'Consolas', monospace;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+/* 进度条 */
+.progress-bar {
+    height: 3px;
+    background: var(--border);
+    flex-shrink: 0;
+}
+.progress-fill {
+    height: 100%;
+    background: var(--accent);
+    width: 0%;
+    transition: width 0.4s ease;
+}
+.progress-status {
+    padding: 8px 24px;
+    font-size: 12px;
+    color: var(--text-muted);
+    flex-shrink: 0;
+    border-bottom: 1px solid var(--border);
+}
+
+/* 内容区 */
+.content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px;
+}
+
+/* 空状态 */
+.empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--text-muted);
+    gap: 16px;
+    text-align: center;
+}
+.empty-state svg { opacity: 0.4; }
+.empty-state h2 { font-size: 18px; font-weight: 500; }
+.empty-state p { font-size: 14px; }
+
+/* 统计区 */
+.stats {
+    display: flex;
+    gap: 24px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 16px;
+    font-size: 14px;
+    color: var(--text-muted);
+}
+.stats strong { color: var(--accent); font-size: 18px; }
+
+/* 角色区 */
+.characters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 16px;
+}
+.char-tag {
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+}
+
+/* 场景列表 */
+.scene {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 8px;
+    overflow: hidden;
+}
+.scene-header {
+    display: flex;
+    align-items: center;
+    padding: 12px 16px;
+    cursor: pointer;
+    background: var(--surface);
+    transition: background 0.15s;
+    user-select: none;
+    gap: 12px;
+}
+.scene-header:hover { background: #1e2a45; }
+.scene-num {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--accent);
+    min-width: 44px;
+}
+.scene-slug {
+    flex: 1;
+    font-size: 14px;
+}
+.scene-meta {
+    font-size: 11px;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+.scene-arrow {
+    font-size: 10px;
+    color: var(--text-muted);
+    transition: transform 0.2s;
+}
+.scene.open .scene-arrow { transform: rotate(90deg); }
+.scene-detail {
+    display: none;
+    padding: 12px 16px 16px;
+    font-size: 14px;
+    line-height: 1.7;
+    border-top: 1px solid var(--border);
+}
+.scene.open .scene-detail { display: block; }
+
+.dialogue-line { padding: 4px 0; }
+.dialogue-char { font-weight: 600; color: var(--accent); }
+.dialogue-paren { color: var(--text-muted); font-size: 13px; }
+.action-line { padding: 4px 0; color: #b0b0c0; font-style: italic; }
+
+/* 完成提示 */
+.done-footer {
+    text-align: center;
+    padding: 24px;
+    color: var(--text-muted);
+    font-size: 12px;
+}
+</style>
+</head>
+<body>
+
+<div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+<div class="progress-status" id="progressStatus">等待主窗口开始转换...</div>
+
+<div class="content" id="content">
+    <div class="empty-state" id="emptyState">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+            <line x1="16" y1="13" x2="8" y2="13"/>
+            <line x1="16" y1="17" x2="8" y2="17"/>
+        </svg>
+        <h2>等待剧本生成</h2>
+        <p>在主窗口中上传小说文件并开始转换，<br>剧本将在此窗口中实时显示。</p>
+    </div>
+</div>
+
+<script>
+const stepLabels = {
+    queued: '排队中...', reading: '读取小说...',
+    directing: '导演预读分析中...', chunking: '分块处理...',
+    orchestrating: '编排场景结构...', calling_experts: '专家并行生成中...',
+    reviewing: '审查剧本...', processing: '生成剧本中...',
+    merging: '合并剧本...', saving: '保存剧本...', done: '完成!',
+};
+
+const fillEl = document.getElementById('progressFill');
+const statusEl = document.getElementById('progressStatus');
+const contentEl = document.getElementById('content');
+const emptyState = document.getElementById('emptyState');
+let sceneCount = 0;
+let charCount = 0;
+let allCharacters = new Set();
+
+function escapeHtml(s) {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+}
+
+function ensureContent() {
+    if (emptyState) { emptyState.remove(); }
+}
+
+function handleProgress(step, percent) {
+    fillEl.style.width = percent + '%';
+    statusEl.textContent = stepLabels[step] || step;
+}
+
+function handleChunkResult(data) {
+    ensureContent();
+
+    // 更新角色
+    if (data.characters && data.characters.length > 0) {
+        let charsEl = contentEl.querySelector('.characters');
+        if (!charsEl) {
+            charsEl = document.createElement('div');
+            charsEl.className = 'characters';
+            contentEl.appendChild(charsEl);
+        }
+        for (const c of data.characters) {
+            if (!allCharacters.has(c.name)) {
+                allCharacters.add(c.name);
+                charCount++;
+                const tag = document.createElement('span');
+                tag.className = 'char-tag';
+                tag.textContent = c.name;
+                charsEl.appendChild(tag);
+            }
+        }
+    }
+
+    // 追加场景
+    if (data.scenes && data.scenes.length > 0) {
+        let scenesContainer = contentEl.querySelector('.scenes-container');
+        if (!scenesContainer) {
+            scenesContainer = document.createElement('div');
+            scenesContainer.className = 'scenes-container';
+            contentEl.appendChild(scenesContainer);
+        }
+
+        for (const s of data.scenes) {
+            sceneCount++;
+            const dCount = (s.content || []).filter(c => c.type === 'dialogue').length;
+            const aCount = (s.content || []).filter(c => c.type === 'action').length;
+
+            let detailHtml = '';
+            for (const item of (s.content || [])) {
+                if (item.type === 'dialogue') {
+                    const paren = item.parenthetical
+                        ? ` <span class="dialogue-paren">(${escapeHtml(item.parenthetical)})</span>`
+                        : '';
+                    detailHtml += `<div class="dialogue-line"><span class="dialogue-char">${escapeHtml(item.character)}</span>${paren}：${escapeHtml(item.line)}</div>`;
+                } else {
+                    detailHtml += `<div class="action-line">${escapeHtml(item.text)}</div>`;
+                }
+            }
+
+            const sceneEl = document.createElement('div');
+            sceneEl.className = 'scene';
+            sceneEl.innerHTML = `
+                <div class="scene-header" onclick="this.parentElement.classList.toggle('open')">
+                    <span class="scene-num">第${s.scene_number}场</span>
+                    <span class="scene-slug">${escapeHtml(s.slugline || '未标场地')}</span>
+                    <span class="scene-meta">${dCount}对白 ${aCount}动作</span>
+                    <span class="scene-arrow">▶</span>
+                </div>
+                <div class="scene-detail">${detailHtml || '<em style="color:#8888aa">无内容</em>'}</div>`;
+            scenesContainer.appendChild(sceneEl);
+        }
+    }
+
+    contentEl.scrollTop = contentEl.scrollHeight;
+}
+
+function handleDone(result) {
+    ensureContent();
+    statusEl.textContent = '完成！';
+
+    // 添加统计
+    let statsEl = contentEl.querySelector('.stats');
+    if (!statsEl) {
+        statsEl = document.createElement('div');
+        statsEl.className = 'stats';
+        const scenesContainer = contentEl.querySelector('.scenes-container');
+        if (scenesContainer) {
+            contentEl.insertBefore(statsEl, scenesContainer);
+        } else {
+            contentEl.appendChild(statsEl);
+        }
+    }
+    statsEl.innerHTML = `
+        <span><strong>${result.scene_count}</strong> 场戏</span>
+        <span><strong>${result.character_count}</strong> 个角色</span>`;
+
+    // 完成提示
+    const footer = document.createElement('div');
+    footer.className = 'done-footer';
+    footer.textContent = `剧本生成完成 · 已保存至 output/${result.novel_name}/${result.novel_name}.yaml`;
+    contentEl.appendChild(footer);
+}
+
+function handleError(error) {
+    ensureContent();
+    statusEl.textContent = '出错了';
+    fillEl.style.background = '#ef4444';
+    const errEl = document.createElement('div');
+    errEl.style.cssText = 'padding:16px;color:#ef4444;text-align:center;';
+    errEl.textContent = error;
+    contentEl.appendChild(errEl);
+}
+
+// 监听 BroadcastChannel
+const channel = new BroadcastChannel('novel2script-stream');
+channel.onmessage = (event) => {
+    const msg = event.data;
+    console.log('[Viewer] received:', msg.type);
+    switch (msg.type) {
+        case 'progress':
+            handleProgress(msg.step, msg.percent);
+            break;
+        case 'chunk_result':
+            handleChunkResult(msg.data);
+            break;
+        case 'done':
+            handleDone(msg.result);
+            break;
+        case 'error':
+            handleError(msg.error);
+            break;
+        case 'reset':
+            // 主窗口要求重置
+            location.reload();
+            break;
+    }
+};
+
+// 向主窗口请求同步数据（如果窗口在新转换开始后才打开）
+channel.postMessage({ type: 'sync_request' });
+</script>
+</body>
+</html>

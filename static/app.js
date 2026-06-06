@@ -43,6 +43,9 @@ const statusText    = statusIndicator.querySelector('.status-text');
 const clearBtn      = document.getElementById('clearBtn');
 const exportBtn     = document.getElementById('exportBtn');
 
+// 剧本窗口
+const openViewerBtn = document.getElementById('openViewerBtn');
+
 // 设置弹窗
 const settingsBtn   = document.getElementById('settingsBtn');
 const settingsModal = document.getElementById('settingsModal');
@@ -58,6 +61,11 @@ let selectedFile = null;
 let conversationHistory = [];
 let scriptContext = '';
 let isConnected = false;
+
+// BroadcastChannel 用于与独立剧本窗口通信
+const scriptChannel = new BroadcastChannel('novel2script-stream');
+let viewerWindow = null;
+let sentChunks = [];  // 缓存已发送的 chunk，供新窗口同步
 
 // API 设置（从 localStorage 加载，运行时覆盖 config.py 的默认值）
 let apiSettings = {
@@ -186,12 +194,14 @@ function handleWsMessage(msg) {
         }
 
         case 'task_progress':
-            updateAiProgress('msg-progress-' + msg.task_id, msg.step, msg.percent);
+            scriptChannel.postMessage({ type: 'progress', step: msg.step, percent: msg.percent });
             break;
 
         case 'task_done': {
             activeTasks.delete(msg.task_id);
-            removeMessage('msg-progress-' + msg.task_id);
+            if (msg.result) {
+                scriptChannel.postMessage({ type: 'done', result: msg.result });
+            }
             const resolver = taskResolvers.get(msg.task_id);
             if (resolver) {
                 resolver.resolve(msg.result);
@@ -202,7 +212,6 @@ function handleWsMessage(msg) {
 
         case 'task_failed': {
             activeTasks.delete(msg.task_id);
-            removeMessage('msg-progress-' + msg.task_id);
             const resolver = taskResolvers.get(msg.task_id);
             if (resolver) {
                 resolver.reject(new Error(msg.error || '转换失败'));
@@ -249,6 +258,9 @@ function bindEvents() {
     settingsModal.addEventListener('click', (e) => {
         if (e.target === settingsModal) closeSettings();
     });
+
+    // 剧本窗口
+    openViewerBtn.addEventListener('click', openScriptViewer);
 
     // 文件选择
     fileInput.addEventListener('change', handleFileSelect);
@@ -372,6 +384,47 @@ function getApiParams() {
     };
 }
 
+// ====== 剧本窗口管理 ======
+
+function openScriptViewer() {
+    if (viewerWindow && !viewerWindow.closed) {
+        viewerWindow.focus();
+        return;
+    }
+    const w = 540;
+    const h = Math.min(screen.height, 900);
+    const left = screen.width - w - 40;
+    const top = (screen.height - h) / 2;
+    viewerWindow = window.open(
+        '/static/script-viewer.html',
+        'scriptViewer',
+        `width=${w},height=${h},left=${left},top=${top},resizable=yes,scrollbars=no`
+    );
+}
+
+function closeScriptViewer() {
+    if (viewerWindow && !viewerWindow.closed) {
+        viewerWindow.close();
+    }
+    sentChunks = [];
+}
+
+function resetScriptStream() {
+    sentChunks = [];
+    scriptChannel.postMessage({ type: 'reset' });
+}
+
+// 监听剧本窗口的同步请求（窗口关闭后重新打开时）
+scriptChannel.onmessage = (event) => {
+    const msg = event.data;
+    if (msg.type === 'sync_request') {
+        // 重放所有已缓存的 chunk
+        for (const chunk of sentChunks) {
+            scriptChannel.postMessage(chunk);
+        }
+    }
+};
+
 // ====== 对话管理 ======
 
 function clearConversation() {
@@ -463,7 +516,7 @@ async function handleSend() {
 
     try {
         if (hasFile) {
-            // --- 文件模式：HTTP 提交 + WS 推送进度 ---
+            // --- 文件模式：SSE 流式 + 独立剧本窗口 ---
             const formData = new FormData();
             formData.append('file', selectedFile);
             const api = getApiParams();
@@ -473,8 +526,13 @@ async function handleSend() {
 
             removeMessage(aiMsgId);
 
+            // 打开剧本窗口，初始化流
+            resetScriptStream();
+            openScriptViewer();
+            openViewerBtn.style.display = '';
+
             try {
-                const data = await convertAsyncWs(formData);
+                const data = await convertStream(formData);
                 scriptContext = JSON.stringify({
                     title: data.title,
                     scenes: data.scenes,
@@ -486,9 +544,10 @@ async function handleSend() {
                     role: 'assistant',
                     content: `已生成剧本初稿「${data.title}」：${data.scene_count}场戏，${data.character_count}个角色。`,
                 });
-                addAiScript(data, showThinking.checked);
+                scriptChannel.postMessage({ type: 'done', result: data });
                 showToast('剧本生成成功', 'success');
             } catch (e) {
+                scriptChannel.postMessage({ type: 'error', error: e.message });
                 addAiError(e.message, null);
                 showToast('转换失败', 'error');
             }
@@ -600,74 +659,76 @@ async function handleSendSSE(aiMsgId) {
     conversationHistory.push({ role: 'assistant', content: fullContent });
 }
 
-// ====== 异步转换（WS 推送 + 轮询降级） ======
-// 降级链：WS 推送 → HTTP 轮询 → 同步转换
+// ====== 流式转换（SSE 进度 + 实时场景渲染） ======
 
-/**
- * 异步转换文件：HTTP 提交任务 + WS 订阅进度。
- * 503 表示 Redis 不可用，降级到同步转换。
- */
-async function convertAsyncWs(formData) {
-    const submitRes = await fetch('/api/v1/convert/async', { method: 'POST', body: formData });
-
-    if (!submitRes.ok) {
-        if (submitRes.status === 503) return await convertSync(formData);
-        const err = await submitRes.json();
-        throw new Error(err.detail || err.error || `HTTP ${submitRes.status}`);
-    }
-
-    const { task_id, novel_name } = await submitRes.json();
-    addAiProgressWithId('msg-progress-' + task_id, `正在转换: ${novel_name}`);
-
-    if (wsReady) {
-        // WS 可用：订阅任务进度，返回 Promise 等待 task_done/task_failed
-        activeTasks.add(task_id);
-        wsSend({ action: 'subscribe_task', task_id: task_id });
-        return new Promise((resolve, reject) => {
-            taskResolvers.set(task_id, { resolve, reject });
-        });
-    } else {
-        // WS 不可用：降级到 HTTP 轮询
-        return await convertAsyncPolling(task_id);
-    }
-}
-
-/** 轮询降级方案 */
-async function convertAsyncPolling(task_id) {
-    const progressId = 'msg-progress-' + task_id;
-    while (true) {
-        await sleep(2000);
-        const pollRes = await fetch(`/api/v1/tasks/${task_id}`);
-        if (!pollRes.ok) {
-            removeMessage(progressId);
-            throw new Error(`轮询失败: HTTP ${pollRes.status}`);
-        }
-        const task = await pollRes.json();
-        updateAiProgress(progressId, task.step, task.percent);
-
-        if (task.status === 'done') {
-            removeMessage(progressId);
-            return task.result;
-        }
-        if (task.status === 'failed') {
-            removeMessage(progressId);
-            throw new Error(task.error || '转换失败');
-        }
-    }
-}
-
-async function convertSync(formData) {
-    const res = await fetch('/api/v1/convert', { method: 'POST', body: formData });
+async function convertStream(formData) {
+    const res = await fetch('/api/v1/convert/stream', { method: 'POST', body: formData });
     if (!res.ok) {
         const err = await res.json();
         throw new Error(err.detail || err.error || `HTTP ${res.status}`);
     }
-    return await res.json();
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let result = null;
+
+    function processLine(line) {
+        if (!line.startsWith('data: ')) return;
+        const data = JSON.parse(line.slice(6));
+
+        if (data.type === 'error') {
+            throw new Error(data.error);
+        }
+        if (data.type === 'progress' && data.step) {
+            scriptChannel.postMessage({ type: 'progress', step: data.step, percent: data.percent });
+        }
+        if (data.type === 'chunk_result' && data.data) {
+            scriptChannel.postMessage({ type: 'chunk_result', data: data.data });
+            sentChunks.push({ type: 'chunk_result', data: data.data });
+        }
+        if (data.type === 'done') {
+            result = data.result;
+        }
+    }
+
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (value) {
+                buffer += decoder.decode(value, { stream: true });
+            }
+            if (done) {
+                // 流结束，处理 buffer 中残留的最后一行
+                if (buffer.trim()) {
+                    try { processLine(buffer.trim()); } catch (_) {}
+                }
+                break;
+            }
+
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+
+            for (const line of lines) {
+                if (line.trim()) {
+                    try { processLine(line); } catch (e) {
+                        console.error('SSE 处理错误:', e, line);
+                    }
+                }
+            }
+        }
+    } catch (e) {
+        console.error('convertStream 错误:', e);
+        scriptChannel.postMessage({ type: 'error', error: e.message });
+        throw e;
+    }
+
+    if (!result) {
+        throw new Error('转换未返回结果');
+    }
+    return result;
 }
 
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 function setSending(sending) {
     textInput.disabled = sending;
@@ -777,7 +838,7 @@ function addAiScript(data, showRaw) {
                         <pre>${scenesList}</pre>
                     </div>
                     <p style="margin-top:14px;font-size:13px;color:var(--text-muted);">
-                        剧本已保存至 output/${escapeHtml(data.novel_name)}/script.yaml。你可以继续在下方输入消息，让我帮你修改剧本。
+                        剧本已保存至 output/${escapeHtml(data.novel_name)}/${escapeHtml(data.novel_name)}.yaml。你可以继续在下方输入消息，让我帮你修改剧本。
                     </p>
                 </div>
             </div>
@@ -859,54 +920,6 @@ function thinkingBoxHtml(id, label, content) {
         </div>
         <div class="thinking-body${openClass}" id="${id}-thinking-body">${content ? escapeHtml(content) : ''}</div>
     </div>`;
-}
-
-/** 进度条消息气泡 */
-function addAiProgress(label) {
-    const id = 'msg-progress-' + Date.now();
-    addAiProgressWithId(id, label);
-    return id;
-}
-
-function addAiProgressWithId(id, label) {
-    const html = `
-        <div class="message ai" id="${id}">
-            <div class="message-avatar">AI</div>
-            <div class="message-body">
-                <div class="bubble">
-                    <div class="progress-container">
-                        <div class="progress-label">${escapeHtml(label)}</div>
-                        <div class="progress-bar-track">
-                            <div class="progress-bar-fill" id="${id}-fill" style="width: 0%"></div>
-                        </div>
-                        <div class="progress-step" id="${id}-step">准备中...</div>
-                    </div>
-                </div>
-            </div>
-        </div>`;
-    chatArea.insertAdjacentHTML('beforeend', html);
-    scrollToBottom();
-}
-
-function updateAiProgress(msgId, step, percent) {
-    const fill = document.getElementById(msgId + '-fill');
-    const stepEl = document.getElementById(msgId + '-step');
-    if (fill) fill.style.width = percent + '%';
-    if (stepEl) {
-        const stepLabels = {
-            queued: '排队中...',
-            reading: '读取小说...',
-            chunking: '分块处理...',
-            prompting: '构建 Prompt...',
-            calling_llm: '调用 LLM（可能需要 10-60 秒）...',
-            llm_complete: 'LLM 响应完成...',
-            parsing: '解析校验...',
-            saving: '保存剧本...',
-            done: '完成!',
-        };
-        stepEl.textContent = stepLabels[step] || step;
-    }
-    scrollToBottom();
 }
 
 function removeMessage(id) {

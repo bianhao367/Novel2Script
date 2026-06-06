@@ -45,8 +45,12 @@ class LLMClient:
             max_retries=0,   # 禁用 SDK 自带重试，由我们自己控制
         )
 
-    def chat(self, messages: list[dict]) -> str:
-        """发送 chat completion 请求，失败时自动重试。"""
+    def chat(self, messages: list[dict], max_tokens: int | None = None) -> str:
+        """发送 chat completion 请求，失败时自动重试。
+
+        Args:
+            max_tokens: 覆盖 config.max_tokens，用于分析类 Agent（输出短，不需要 4096）。
+        """
         last_error: Exception | None = None
         delay = 2.0  # 初始退避时间（秒）
 
@@ -56,7 +60,7 @@ class LLMClient:
                     model=self.config.model,
                     messages=messages,
                     temperature=self.config.temperature,
-                    max_tokens=self.config.max_tokens,
+                    max_tokens=max_tokens or self.config.max_tokens,
                 )
                 content = response.choices[0].message.content
                 if content is None:

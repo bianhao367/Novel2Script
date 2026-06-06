@@ -269,6 +269,184 @@ def build_director_prompt(
     ]
 
 
+# --- 编排 Agent Prompt ---
+
+ORCHESTRATOR_PROMPT = """\
+你是一名剧本编排师。你的任务是分析小说片段的结构，确定场景划分和段落类型。
+
+**角色注册表（已知角色）：**
+{current_characters}
+
+请输出合法的 YAML，格式如下：
+
+```yaml
+scenes:
+  - scene_number: {start_scene_number}
+    slugline: "内/外. 地点 - 时间"
+    paragraphs:
+      - para_idx: 0
+        content_type: "action"
+      - para_idx: 1
+        content_type: "dialogue"
+      - para_idx: 2
+        content_type: "action"
+```
+
+规则：
+- 按场景切换（地点变化、时间跳跃）划分场景
+- slugline 格式: "内/外. 具体地点 - 时间"
+- 对每个段落标记 content_type：包含角色对话的标为 "dialogue"，其余标为 "action"
+- para_idx 从 0 开始，按原文段落顺序递增
+- scene_number 从 {start_scene_number} 开始
+- 不要生成任何剧本内容，只做结构分析
+"""
+
+
+def build_orchestrator_prompt(
+    novel_text: str,
+    current_characters: dict[str, dict],
+    start_scene_number: int,
+) -> list[dict]:
+    """构建编排 Agent 的 prompt。"""
+    char_text = _format_character_registry(current_characters)
+
+    system_content = ORCHESTRATOR_PROMPT.format(
+        current_characters=char_text,
+        start_scene_number=start_scene_number,
+    )
+
+    # 为段落编号，方便 LLM 引用 para_idx
+    paragraphs = novel_text.split("\n\n")
+    numbered_text = ""
+    for i, para in enumerate(paragraphs):
+        para = para.strip()
+        if para:
+            numbered_text += f"[段落{i}] {para}\n\n"
+
+    return [
+        {"role": "system", "content": system_content},
+        {
+            "role": "user",
+            "content": "请分析以下小说片段的结构：\n\n" + numbered_text,
+        },
+    ]
+
+
+# --- 对白专家 Prompt ---
+
+DIALOGUE_AGENT_PROMPT = """\
+你是一名专业编剧，专门负责编写对白。你的任务是根据小说片段中的对话内容，提取并优化角色台词。
+
+**角色注册表：**
+{current_characters}
+
+请输出合法的 YAML，格式如下：
+
+```yaml
+items:
+  - scene_number: 1
+    para_idx: 1
+    character: "角色名"
+    line: "台词正文"
+    parenthetical: "情绪或动作提示"
+```
+
+规则：
+- 只处理标为 dialogue 的段落（包含角色对话的段落）
+- para_idx 必须与输入中标注的段落编号一致
+- character 必须与角色注册表中的名称一致
+- line 是角色的实际台词，忠实还原原著对话
+- parenthetical 是情绪/动作提示（可选），如"愤怒地"、"低声"、"转身"
+- 如果一个段落包含多句对白，拆分为多个 items（相同 para_idx）
+- 不要输出任何 action/舞台指示内容
+"""
+
+
+def build_dialogue_agent_prompt(
+    novel_text: str,
+    current_characters: dict[str, dict],
+    dialogue_paragraphs: list[tuple[int, str]],
+    start_scene_number: int,
+) -> list[dict]:
+    """构建对白专家的 prompt。
+
+    Args:
+        novel_text: 原始小说文本（用于上下文参考）
+        current_characters: 角色注册表
+        dialogue_paragraphs: [(para_idx, text), ...] 对白段落列表
+        start_scene_number: 起始场景号
+    """
+    char_text = _format_character_registry(current_characters)
+    # 将对白段落带编号拼接
+    para_text = "\n\n".join(f"[段落{idx}] {text}" for idx, text in dialogue_paragraphs)
+
+    system_content = DIALOGUE_AGENT_PROMPT.format(current_characters=char_text)
+
+    return [
+        {"role": "system", "content": system_content},
+        {
+            "role": "user",
+            "content": "请从以下对白段落中提取角色台词：\n\n" + para_text,
+        },
+    ]
+
+
+# --- 动作专家 Prompt ---
+
+ACTION_AGENT_PROMPT = """\
+你是一名专业编剧，专门负责编写动作和舞台指示。你的任务是根据小说片段中的描写内容，转换为剧本中的动作描述。
+
+**角色注册表：**
+{current_characters}
+
+请输出合法的 YAML，格式如下：
+
+```yaml
+items:
+  - scene_number: 1
+    para_idx: 0
+    text: "动作或舞台指示的描述文字"
+```
+
+规则：
+- 只处理标为 action 的段落（场景描写、动作描述、心理活动等）
+- para_idx 必须与输入中标注的段落编号一致
+- text 是舞台指示或场景描写，用现在时态
+- 忠实还原原著的场景氛围和人物动作
+- 不要输出任何对白/台词内容
+- 如果一个段落包含多个动作描述，可以拆分为多个 items（相同 para_idx）
+"""
+
+
+def build_action_agent_prompt(
+    novel_text: str,
+    current_characters: dict[str, dict],
+    action_paragraphs: list[tuple[int, str]],
+    start_scene_number: int,
+) -> list[dict]:
+    """构建动作专家的 prompt。
+
+    Args:
+        novel_text: 原始小说文本（用于上下文参考）
+        current_characters: 角色注册表
+        action_paragraphs: [(para_idx, text), ...] 动作段落列表
+        start_scene_number: 起始场景号
+    """
+    char_text = _format_character_registry(current_characters)
+    # 将动作段落带编号拼接
+    para_text = "\n\n".join(f"[段落{idx}] {text}" for idx, text in action_paragraphs)
+
+    system_content = ACTION_AGENT_PROMPT.format(current_characters=char_text)
+
+    return [
+        {"role": "system", "content": system_content},
+        {
+            "role": "user",
+            "content": "请将以下动作段落转换为舞台指示：\n\n" + para_text,
+        },
+    ]
+
+
 # --- 审查 Agent Prompt ---
 
 REVIEW_PROMPT = """\

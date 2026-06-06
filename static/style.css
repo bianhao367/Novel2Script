@@ -1107,6 +1107,11 @@ body {
     margin-top: 6px;
 }
 
+.icon-btn.active {
+    background: var(--accent-light);
+    color: var(--accent);
+}
+
 /* ====== 响应式 ====== */
 @media (max-width: 640px) {
     .header { padding: 0 16px; }

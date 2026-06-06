@@ -37,7 +37,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from rq import Queue
+
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from src.config import Config, ApiConfig, PipelineConfig, load_config
@@ -60,6 +60,7 @@ MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 # WebSocket 连接管理器
 manager = ConnectionManager()
 _executor = ThreadPoolExecutor(max_workers=4)
+_memory_tasks: dict[str, dict] = {}  # Redis 不可用时内存中跟踪任务状态
 
 
 # --- 请求模型 ---
@@ -304,7 +305,7 @@ def convert(
     base_url: str = Form(""),
     api_key: str = Form(""),
 ):
-    """上传小说 .txt 文件，返回转换后的剧本。"""
+    """上传小说 .txt 文件，返回转换后的剧本（同步阻塞，无进度）。"""
     if not file.filename or not file.filename.lower().endswith(".txt"):
         raise HTTPException(status_code=400, detail="只接受 .txt 文件")
 
@@ -322,7 +323,7 @@ def convert(
     try:
         config = _apply_settings(load_config(), model, base_url, api_key)
         pipeline = Pipeline(config)
-        script = pipeline.run(tmp_path)
+        script = pipeline.run(tmp_path, novel_name)
         return _script_to_response(script, novel_name)
     except LLMError as e:
         raise HTTPException(status_code=502, detail=f"LLM 调用失败: {e}")
@@ -335,6 +336,86 @@ def convert(
         Path(tmp_path).unlink(missing_ok=True)
 
 
+@app.post("/api/v1/convert/stream")
+def convert_stream(
+    file: UploadFile = File(...),
+    model: str = Form(""),
+    base_url: str = Form(""),
+    api_key: str = Form(""),
+):
+    """上传小说 .txt 文件，SSE 流式返回进度 + 最终结果（无需 Redis）。"""
+    if not file.filename or not file.filename.lower().endswith(".txt"):
+        raise HTTPException(status_code=400, detail="只接受 .txt 文件")
+
+    content = file.file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail=f"文件过大，上限 {MAX_FILE_SIZE // 1024 // 1024} MB")
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="文件为空")
+
+    novel_name = Path(file.filename).stem
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=".txt", delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    def event_generator():
+        import queue
+        msg_queue: queue.Queue = queue.Queue()
+
+        def progress_callback(step: str, percent: int):
+            msg_queue.put({"type": "progress", "step": step, "percent": percent})
+
+        def chunk_result_callback(data: dict):
+            msg_queue.put({"type": "chunk_result", "data": data})
+
+        def run_pipeline():
+            try:
+                config = _apply_settings(load_config(), model, base_url, api_key)
+                pipeline = Pipeline(
+                    config,
+                    progress_callback=progress_callback,
+                    chunk_result_callback=chunk_result_callback,
+                )
+                script = pipeline.run(tmp_path, novel_name)
+                result = _script_to_response(script, novel_name)
+                msg_queue.put({"type": "done", "result": result})
+            except Exception as e:
+                msg_queue.put({"type": "error", "error": f"{type(e).__name__}: {e}"})
+            finally:
+                Path(tmp_path).unlink(missing_ok=True)
+
+        _executor.submit(run_pipeline)
+
+        while True:
+            try:
+                item = msg_queue.get(timeout=600)
+            except Exception:
+                yield f"data: {json.dumps({'type': 'error', 'error': '处理超时'})}\n\n"
+                break
+
+            msg_type = item.get("type")
+            if msg_type == "error":
+                yield f"data: {json.dumps({'type': 'error', 'error': item['error']})}\n\n"
+                break
+            elif msg_type == "done":
+                yield f"data: {json.dumps({'type': 'done', 'result': item['result']}, ensure_ascii=False)}\n\n"
+                break
+            elif msg_type == "chunk_result":
+                yield f"data: {json.dumps({'type': 'chunk_result', 'data': item['data']}, ensure_ascii=False)}\n\n"
+            else:  # progress
+                yield f"data: {json.dumps({'type': 'progress', 'step': item['step'], 'percent': item['percent']})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post("/api/v1/convert/async")
 def convert_async(
     file: UploadFile = File(...),
@@ -342,17 +423,12 @@ def convert_async(
     base_url: str = Form(""),
     api_key: str = Form(""),
 ):
-    """异步转换：提交任务到 rq 队列，立即返回 task_id。
+    """异步转换：在服务端线程池中运行 pipeline，通过 Redis/WS 推送进度。
 
-    流程：
-    1. 校验文件并保存到临时目录
-    2. 在 Redis 中初始化任务状态（Hash）
-    3. 将任务提交到 rq 队列，worker 会异步执行
-    4. 前端通过 WebSocket subscribe_task 或 HTTP 轮询获取进度
+    Redis 可用时通过 Pub/Sub 推送进度给 WebSocket 客户端，
+    Redis 不可用时降级到 HTTP 轮询（通过内存状态跟踪）。
     """
     r = _get_redis()
-    if r is None:
-        raise HTTPException(status_code=503, detail="Redis 不可用，请使用 /api/v1/convert 同步模式")
 
     if not file.filename or not file.filename.lower().endswith(".txt"):
         raise HTTPException(status_code=400, detail="只接受 .txt 文件")
@@ -369,57 +445,122 @@ def convert_async(
         tmp_path = tmp.name
 
     task_id = str(uuid.uuid4())
+    task_key = f"task:{task_id}"
 
-    # 初始化任务状态，1 小时后自动过期
-    r.hset(f"task:{task_id}", mapping={
-        "status": "queued",
-        "step": "queued",
-        "percent": "0",
-        "novel_name": novel_name,
-    })
-    r.expire(f"task:{task_id}", 3600)
+    # 初始化任务状态
+    if r:
+        r.hset(task_key, mapping={
+            "status": "queued", "step": "queued", "percent": "0",
+            "novel_name": novel_name,
+        })
+        r.expire(task_key, 3600)
 
-    # 提交到 rq 队列，worker.run_conversion 会在独立进程中执行
-    q = Queue(connection=r)
-    q.enqueue(
-        "worker.run_conversion",
-        task_id, tmp_path, model, base_url, api_key,
-        job_id=task_id,
-        job_timeout="10m",
-    )
+    def progress_callback(step: str, percent: int):
+        if r:
+            r.hset(task_key, mapping={
+                "step": step, "percent": str(percent), "status": "processing",
+            })
+            r.publish(f"task_events:{task_id}", json.dumps({
+                "task_id": task_id, "step": step,
+                "percent": percent, "status": "processing",
+            }))
+        else:
+            # 无 Redis：存内存供轮询
+            _memory_tasks[task_id] = {
+                "status": "processing", "step": step, "percent": percent,
+            }
+
+    def run_pipeline():
+        try:
+            config = _apply_settings(load_config(), model, base_url, api_key)
+            pipeline = Pipeline(config, progress_callback=progress_callback)
+            script = pipeline.run(tmp_path, novel_name)
+            result = _script_to_response(script, novel_name)
+
+            if r:
+                r.hset(task_key, mapping={
+                    "status": "done", "step": "done", "percent": "100",
+                    "result": json.dumps(result, ensure_ascii=False),
+                })
+                r.publish(f"task_events:{task_id}", json.dumps({
+                    "task_id": task_id, "status": "done", "step": "done",
+                    "percent": 100, "result": result,
+                }, ensure_ascii=False))
+            else:
+                _memory_tasks[task_id] = {
+                    "status": "done", "step": "done", "percent": 100,
+                    "result": result, "novel_name": novel_name,
+                }
+        except Exception as e:
+            error_msg = f"{type(e).__name__}: {e}"
+            traceback.print_exc()
+            if r:
+                r.hset(task_key, mapping={
+                    "status": "failed", "step": "error", "percent": "0",
+                    "error": error_msg,
+                })
+                r.publish(f"task_events:{task_id}", json.dumps({
+                    "task_id": task_id, "status": "failed",
+                    "step": "error", "percent": 0, "error": error_msg,
+                }))
+            else:
+                _memory_tasks[task_id] = {
+                    "status": "failed", "step": "error", "percent": 0,
+                    "error": error_msg,
+                }
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+            if r:
+                r.expire(task_key, 3600)
+
+    _executor.submit(run_pipeline)
 
     return {"task_id": task_id, "novel_name": novel_name}
 
 
 @app.get("/api/v1/tasks/{task_id}")
 def get_task_status(task_id: str):
-    """查询异步转换任务的进度和结果。"""
+    """查询异步转换任务的进度和结果。Redis 优先，内存后备。"""
+    # 先查 Redis
     r = _get_redis()
-    if r is None:
-        raise HTTPException(status_code=503, detail="Redis 不可用")
+    if r:
+        key = f"task:{task_id}"
+        data = r.hgetall(key)
+        if data:
+            info = {k.decode(): v.decode() for k, v in data.items()}
+            status = info.get("status", "unknown")
+            resp = {
+                "task_id": task_id,
+                "status": status,
+                "step": info.get("step", ""),
+                "percent": int(info.get("percent", 0)),
+                "novel_name": info.get("novel_name", ""),
+            }
+            if status == "done" and "result" in info:
+                resp["result"] = json.loads(info["result"])
+            elif status == "failed":
+                resp["error"] = info.get("error", "Unknown error")
+            return resp
 
-    key = f"task:{task_id}"
-    data = r.hgetall(key)
+    # 内存后备
+    data = _memory_tasks.get(task_id)
     if not data:
         raise HTTPException(status_code=404, detail="任务不存在")
 
-    info = {k.decode(): v.decode() for k, v in data.items()}
-    status = info.get("status", "unknown")
-
-    response = {
+    resp = {
         "task_id": task_id,
-        "status": status,
-        "step": info.get("step", ""),
-        "percent": int(info.get("percent", 0)),
-        "novel_name": info.get("novel_name", ""),
+        "status": data.get("status", "unknown"),
+        "step": data.get("step", ""),
+        "percent": data.get("percent", 0),
+        "novel_name": data.get("novel_name", ""),
     }
 
-    if status == "done" and "result" in info:
-        response["result"] = json.loads(info["result"])
-    elif status == "failed":
-        response["error"] = info.get("error", "Unknown error")
+    if data.get("status") == "done" and "result" in data:
+        resp["result"] = data["result"]
+    elif data.get("status") == "failed":
+        resp["error"] = data.get("error", "Unknown error")
 
-    return response
+    return resp
 
 
 @app.post("/api/v1/chat")
