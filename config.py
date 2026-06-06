@@ -11,3 +11,10 @@ OUTPUT_DIR = "./output"        # 输出根目录
 OUTPUT_FORMAT = "yaml"         # 输出格式
 OVERLAP_SIZE = 500             # 滑动窗口重叠字符数
 EVENT_MEMORY_MAX_CHARS = 1500  # 事件记忆最大字符数，超过则自动压缩
+
+# --- 导演 Agent ---
+DIRECTOR_ENABLED = True        # 是否启用导演 Agent 全局预读
+DIRECTOR_CHUNK_SIZE = 5000     # 导演预读的分块大小（比生成分块大，减少调用次数）
+
+# --- 审查闭环 ---
+REVIEW_MAX_ROUNDS = 3          # 审查最大轮次（1=单次审查+单次修正，兼容旧行为）

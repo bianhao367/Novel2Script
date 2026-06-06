@@ -90,6 +90,12 @@ class ReviewResult(BaseModel):
     suggestions: str = ""
 
 
+class NovelAnalysis(BaseModel):
+    """导演 Agent 的输出结构：小说片段分析"""
+    characters: list[CharacterUpdate] = Field(default_factory=list)
+    plot_events: str = ""
+
+
 def _strip_code_fences(text: str) -> str:
     """去除 LLM 输出中可能包含的 markdown 代码块标记。"""
     cleaned = text.strip()
@@ -97,7 +103,7 @@ def _strip_code_fences(text: str) -> str:
         lines = cleaned.split("\n")
         if lines[0].startswith("```"):
             lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
+        if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         cleaned = "\n".join(lines).strip()
     return cleaned
@@ -175,6 +181,24 @@ def parse_review_result(yaml_text: str) -> ReviewResult:
         raise ValueError(f"审查结果 Schema 校验失败:\n{e}") from e
 
 
+def parse_novel_analysis(yaml_text: str) -> NovelAnalysis:
+    """解析导演 Agent 输出的 YAML。"""
+    cleaned = _strip_code_fences(yaml_text)
+
+    try:
+        raw = yaml.safe_load(cleaned)
+    except yaml.YAMLError as e:
+        raise ValueError(f"导演分析 YAML 格式错误: {e}") from e
+
+    if raw is None:
+        raise ValueError("导演分析 YAML 为空")
+
+    try:
+        return NovelAnalysis(**raw)
+    except ValidationError as e:
+        raise ValueError(f"导演分析 Schema 校验失败:\n{e}") from e
+
+
 def merge_scripts(scripts: list[Script]) -> Script:
     """将多个分块生成的 Script 合并为一个完整的 Script。
 
@@ -223,6 +247,10 @@ def compress_event_memory(event_summaries: list[str], max_chars: int) -> str:
     full_text = "\n".join(event_summaries)
     if len(full_text) <= max_chars:
         return full_text
+
+    # 极小预算防护：至少保留最近一条摘要的前 max_chars 个字符
+    if max_chars <= 20:
+        return event_summaries[-1][:max_chars]
 
     prefix = "[早期情节已省略]\n"
     budget = max_chars - len(prefix)

@@ -210,6 +210,65 @@ def build_memory_update_prompt(
     ]
 
 
+# --- 导演 Agent Prompt ---
+
+DIRECTOR_PROMPT = """\
+你是一名资深导演。你的任务是通读小说片段，提取全局信息以便后续编剧团队使用。
+
+**当前片段是小说的第 {chunk_index} / {total_chunks} 部分。**
+
+**已有角色注册表（请在此基础上更新）：**
+{current_characters}
+
+请输出合法的 YAML，格式如下：
+
+```yaml
+characters:
+  - name: "角色名"
+    description: "角色简介（性格、外貌、身份、关系）"
+    is_main: true/false
+plot_events: "本片段发生的关键剧情事件（1-3句话）"
+```
+
+规则：
+- 列出本片段中出现的所有角色，is_main=true 标记主角（戏份多、推动剧情）
+- 已在角色注册表中的角色：如有新信息则更新 description，否则仅列出 name
+- plot_events 聚焦于情节推进和人物关系变化，简洁概括
+- 不要遗漏重要角色或关键剧情转折
+"""
+
+
+def build_director_prompt(
+    novel_text: str,
+    current_characters: dict[str, dict],
+    chunk_index: int,
+    total_chunks: int,
+) -> list[dict]:
+    """构建导演 Agent 的 prompt。
+
+    Args:
+        novel_text: 当前块的小说文本
+        current_characters: 当前已积累的角色注册表
+        chunk_index: 当前块序号（从1开始）
+        total_chunks: 总块数
+    """
+    char_text = _format_character_registry(current_characters)
+
+    system_content = DIRECTOR_PROMPT.format(
+        current_characters=char_text,
+        chunk_index=chunk_index,
+        total_chunks=total_chunks,
+    )
+
+    return [
+        {"role": "system", "content": system_content},
+        {
+            "role": "user",
+            "content": "请分析以下小说片段，提取角色和剧情信息：\n\n" + novel_text,
+        },
+    ]
+
+
 # --- 审查 Agent Prompt ---
 
 REVIEW_PROMPT = """\
@@ -268,4 +327,34 @@ def build_review_prompt(
             "role": "user",
             "content": f"以下是待审查的剧本片段 YAML：\n\n{script_fragment_yaml}",
         },
+    ]
+
+
+def build_fix_prompt(
+    script_fragment_yaml: str,
+    review_issues: list[str],
+    review_suggestions: str,
+    original_novel_text: str,
+) -> list[dict]:
+    """构建修正 prompt，将审查问题注入上下文供编剧针对性修改。
+
+    Args:
+        script_fragment_yaml: 当前剧本 YAML 文本
+        review_issues: 审查发现的问题列表
+        review_suggestions: 审查给出的修正建议
+        original_novel_text: 原始小说片段（供编剧参考还原）
+    """
+    issues_text = "\n".join(f"- {issue}" for issue in review_issues)
+
+    return [
+        {"role": "system", "content": (
+            "你是一名专业编剧。审查员发现了以下问题，请针对性修正剧本。\n"
+            "只输出修正后的完整 YAML，不要添加额外文字。"
+        )},
+        {"role": "user", "content": (
+            f"审查发现的问题：\n{issues_text}\n\n"
+            f"修正建议：{review_suggestions}\n\n"
+            f"原始小说片段（供参考）：\n{original_novel_text}\n\n"
+            f"当前剧本 YAML：\n{script_fragment_yaml}"
+        )},
     ]

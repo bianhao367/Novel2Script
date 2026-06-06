@@ -24,10 +24,13 @@ from src.config import Config, load_config
 from src.llm_client import LLMClient
 from src.parser import (
     Script, parse_yaml, script_to_yaml,
-    parse_memory_update, parse_review_result,
+    parse_memory_update, parse_review_result, parse_novel_analysis,
     merge_scripts, compress_event_memory,
 )
-from src.prompt import build_memory_prompt, build_memory_update_prompt, build_review_prompt
+from src.prompt import (
+    build_memory_prompt, build_memory_update_prompt,
+    build_review_prompt, build_director_prompt, build_fix_prompt,
+)
 from src.reader import NovelReader
 from src.schema_gen import generate_json_schema, generate_markdown_doc
 
@@ -49,7 +52,7 @@ class Pipeline:
         self._progress = progress_callback or (lambda step, pct: None)
 
     def run(self, novel_path: str | Path) -> Script:
-        """对一部小说执行完整流程：多块滑动窗口 + 记忆管理。"""
+        """对一部小说执行完整流程：导演预读 → 滑动窗口分块 → 逐块生成 → 多轮审查 → 合并输出。"""
         novel_path = Path(novel_path)
         novel_name = novel_path.stem
         novel_dir = self.output_dir / novel_name
@@ -60,23 +63,32 @@ class Pipeline:
         self._progress("reading", 5)
         print(f"已读取小说: {novel_path} ({reader.char_count} 字符)")
 
-        # 2. 滑动窗口分块
-        overlap = self.config.pipeline.overlap_size
-        chunks = reader.chunks_with_overlap(self.config.pipeline.chunk_size, overlap)
-        total_chunks = len(chunks)
-        self._progress("chunking", 10)
-        print(f"小说共 {total_chunks} 块（overlap={overlap} 字符）")
-
-        # 3. 初始化记忆状态
+        # 2. 初始化记忆状态
         character_registry: dict[str, dict] = {}  # name -> {description, is_main}
         event_summaries: list[str] = []
         chunk_scripts: list[Script] = []
         next_scene_number = 1
 
-        # 4. 逐块处理
+        # 3. Phase 1: 导演预读（全局分析）
+        if self.config.pipeline.director_enabled:
+            self._run_director_phase(reader, novel_dir, character_registry, event_summaries)
+
+        # 4. Phase 2: 滑动窗口分块 + 逐块生成剧本
+        overlap = self.config.pipeline.overlap_size
+        chunks = reader.chunks_with_overlap(self.config.pipeline.chunk_size, overlap)
+        total_chunks = len(chunks)
+        phase2_start_pct = 40 if self.config.pipeline.director_enabled else 10
+        self._progress("chunking", phase2_start_pct)
+        print(f"小说共 {total_chunks} 块（overlap={overlap} 字符）")
+
+        if total_chunks == 0:
+            print("警告：小说内容为空，无法生成剧本")
+            self._progress("done", 100)
+            return Script()
+
         for i, chunk in enumerate(chunks):
             chunk_idx = i + 1
-            base_pct = 10 + int(80 * i / total_chunks)
+            base_pct = phase2_start_pct + int(50 * i / total_chunks)
             self._progress("processing", base_pct)
             print(f"\n--- 处理第 {chunk_idx}/{total_chunks} 块 ({len(chunk)} 字符) ---")
 
@@ -116,48 +128,64 @@ class Pipeline:
                 ]
                 raw_output = self.llm.chat(fix_messages)
                 raw_path.write_text(raw_output, encoding="utf-8")
-                script_fragment = parse_yaml(raw_output)
+                try:
+                    script_fragment = parse_yaml(raw_output)
+                except ValueError as retry_err:
+                    print(f"块 {chunk_idx} 二次解析仍失败，跳过此块: {retry_err}")
+                    continue
 
-            # ---- LLM Call 2: 审查剧本片段 ----
-            self._progress("reviewing", base_pct + 5)
-            review_messages = build_review_prompt(
-                script_fragment_yaml=raw_output,
-                current_characters=character_registry,
-                start_scene_number=next_scene_number,
-            )
-            review_raw = self.llm.chat(review_messages)
+            # ---- LLM Call 2: 多轮审查闭环 ----
+            raw_output_before_review = raw_output
+            script_fragment_before_review = script_fragment
+            max_rounds = self.config.pipeline.review_max_rounds
 
-            try:
-                review_result = parse_review_result(review_raw)
-            except ValueError as rev_err:
-                print(f"  块 {chunk_idx} 审查结果解析失败（跳过）: {rev_err}")
-                review_result = None
+            for review_round in range(max_rounds):
+                self._progress("reviewing", min(base_pct + 5 + review_round, 89))
 
-            if review_result and not review_result.valid:
-                # 审查不通过，带修正建议重试一次
-                print(f"  块 {chunk_idx} 审查不通过: {review_result.issues}")
-                raw_output_before_review = raw_output  # 保存原始输出，重试失败时还原
-                script_fragment_before_review = script_fragment
-
-                fix_messages = messages + [
-                    {"role": "assistant", "content": raw_output},
-                    {"role": "user", "content": (
-                        f"审查发现问题：\n{chr(10).join('- ' + i for i in review_result.issues)}\n\n"
-                        f"修正建议：{review_result.suggestions}\n\n"
-                        "请根据以上问题重新输出修正后的完整 YAML，不要添加额外文字。"
-                    )},
-                ]
-                retry_output = self.llm.chat(fix_messages)
+                review_messages = build_review_prompt(
+                    script_fragment_yaml=raw_output,
+                    current_characters=character_registry,
+                    start_scene_number=next_scene_number,
+                )
+                review_raw = self.llm.chat(review_messages)
 
                 try:
-                    script_fragment = parse_yaml(retry_output)
-                    raw_output = retry_output
-                    raw_path.write_text(raw_output, encoding="utf-8")
-                    print(f"  块 {chunk_idx} 修正后重新解析成功")
+                    review_result = parse_review_result(review_raw)
+                except ValueError as rev_err:
+                    print(f"  块 {chunk_idx} 审查结果解析失败（跳过审查）: {rev_err}")
+                    break
+
+                if review_result.valid:
+                    break
+
+                print(f"  块 {chunk_idx} 审查第 {review_round + 1} 轮不通过: {review_result.issues}")
+
+                # 最后一轮不修正，让循环自然结束触发 else 回滚
+                if review_round == max_rounds - 1:
+                    continue
+
+                # 构建修正 prompt 并重试
+                fix_messages = build_fix_prompt(
+                    script_fragment_yaml=raw_output,
+                    review_issues=review_result.issues,
+                    review_suggestions=review_result.suggestions,
+                    original_novel_text=chunk,
+                )
+                fix_raw = self.llm.chat(fix_messages)
+
+                try:
+                    script_fragment = parse_yaml(fix_raw)
+                    raw_output = fix_raw
                 except ValueError as e:
-                    print(f"  块 {chunk_idx} 修正后仍解析失败，使用原始结果: {e}")
-                    raw_output = raw_output_before_review
-                    script_fragment = script_fragment_before_review
+                    print(f"  块 {chunk_idx} 修正后解析失败: {e}")
+                    break
+            else:
+                # 所有轮次都未通过（循环自然结束，未被 break），回滚到原始版本
+                print(f"  块 {chunk_idx} 审查 {max_rounds} 轮均未通过，回滚到原始版本")
+                raw_output = raw_output_before_review
+                script_fragment = script_fragment_before_review
+
+            raw_path.write_text(raw_output, encoding="utf-8")
 
             # 更新场景编号
             if script_fragment.scenes:
@@ -182,7 +210,6 @@ class Pipeline:
                 memory_update = None
 
             if memory_update:
-                # 更新角色注册表
                 for char in memory_update.characters:
                     existing = character_registry.get(char.name)
                     if existing is None:
@@ -223,6 +250,79 @@ class Pipeline:
 
         self._progress("done", 100)
         return final_script
+
+    def _run_director_phase(
+        self,
+        reader: NovelReader,
+        novel_dir: Path,
+        character_registry: dict[str, dict],
+        event_summaries: list[str],
+    ):
+        """Phase 1: 导演预读——滑动窗口遍历全文，提取角色和剧情信息。
+
+        使用 director_chunk_size（比生成分块大）减少调用次数，
+        不做剧本生成，只做全局分析。结果预填充 character_registry 和 event_summaries。
+        """
+        dir_chunk_size = self.config.pipeline.director_chunk_size
+        dir_overlap = self.config.pipeline.overlap_size
+        dir_chunks = reader.chunks_with_overlap(dir_chunk_size, dir_overlap)
+        total_dir_chunks = len(dir_chunks)
+
+        self._progress("directing", 10)
+        print(f"\n=== Phase 1: 导演预读（{total_dir_chunks} 块, chunk_size={dir_chunk_size}）===")
+
+        if total_dir_chunks == 0:
+            print("警告：小说内容过短，跳过导演预读")
+            return
+
+        for i, chunk in enumerate(dir_chunks):
+            chunk_idx = i + 1
+            pct = 10 + int(25 * chunk_idx / total_dir_chunks)
+            self._progress("directing", pct)
+            print(f"  导演分析第 {chunk_idx}/{total_dir_chunks} 块...")
+
+            messages = build_director_prompt(
+                novel_text=chunk,
+                current_characters=character_registry,
+                chunk_index=chunk_idx,
+                total_chunks=total_dir_chunks,
+            )
+
+            raw_output = self.llm.chat(messages)
+
+            # 保存原始输出供调试
+            debug_path = novel_dir / f"director_chunk_{chunk_idx}.txt"
+            debug_path.write_text(raw_output, encoding="utf-8")
+
+            try:
+                analysis = parse_novel_analysis(raw_output)
+            except ValueError as e:
+                print(f"  导演分析第 {chunk_idx} 块解析失败（跳过）: {e}")
+                continue
+
+            # 更新角色注册表
+            for char in analysis.characters:
+                existing = character_registry.get(char.name)
+                if existing is None:
+                    character_registry[char.name] = {
+                        "description": char.description,
+                        "is_main": char.is_main,
+                    }
+                else:
+                    if len(char.description) > len(existing["description"]):
+                        character_registry[char.name]["description"] = char.description
+                    if char.is_main:
+                        character_registry[char.name]["is_main"] = True
+
+            # 收集剧情事件
+            if analysis.plot_events:
+                event_summaries.append(f"[第{chunk_idx}段] {analysis.plot_events}")
+
+            print(f"    角色: {len(analysis.characters)}, "
+                  f"剧情: {analysis.plot_events[:50] if analysis.plot_events else '无'}...")
+
+        print(f"导演预读完成: 共 {len(character_registry)} 个角色, "
+              f"{len(event_summaries)} 段剧情摘要")
 
 
 def run_pipeline(novel_path: str) -> Script:

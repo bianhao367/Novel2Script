@@ -36,6 +36,9 @@ class PipelineConfig:
     output_format: str = "yaml"   # 剧本输出格式（yaml/json）
     overlap_size: int = 500          # 滑动窗口重叠字符数，保证上下文连贯
     event_memory_max_chars: int = 1500  # 事件记忆最大字符数，超过自动压缩
+    director_enabled: bool = True    # 是否启用导演 Agent 全局预读
+    director_chunk_size: int = 5000  # 导演预读的分块大小
+    review_max_rounds: int = 3       # 审查最大轮次
 
 
 @dataclass
@@ -77,6 +80,9 @@ def load_config() -> Config:
         output_format=getattr(root_cfg, "OUTPUT_FORMAT", "yaml"),
         overlap_size=getattr(root_cfg, "OVERLAP_SIZE", 500),
         event_memory_max_chars=getattr(root_cfg, "EVENT_MEMORY_MAX_CHARS", 1500),
+        director_enabled=getattr(root_cfg, "DIRECTOR_ENABLED", True),
+        director_chunk_size=getattr(root_cfg, "DIRECTOR_CHUNK_SIZE", 5000),
+        review_max_rounds=getattr(root_cfg, "REVIEW_MAX_ROUNDS", 3),
     )
 
     return Config(
