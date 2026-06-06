@@ -59,16 +59,30 @@ class Config:
     max_tokens: int = 4096     # 单次最大生成 token 数
 
 
+# 配置缓存：避免每次请求都重新执行 config.py
+_cached_config: Config | None = None
+_config_mtime: float = 0.0
+
+
 def load_config() -> Config:
     """
     加载配置：API 凭据来自 .env，运行参数来自根目录 config.py。
 
     根目录 config.py 是一个普通 Python 文件，通过 importlib 动态加载，
     读取其中的 MODEL、CHUNK_SIZE、OUTPUT_DIR 等变量。
+
+    带文件修改时间缓存：config.py 未变化时直接返回缓存，避免重复执行。
     """
-    import importlib.util
+    global _cached_config, _config_mtime
 
     root_config_path = ROOT_DIR / "config.py"
+    current_mtime = root_config_path.stat().st_mtime
+
+    if _cached_config is not None and current_mtime == _config_mtime:
+        return _cached_config
+
+    import importlib.util
+
     spec = importlib.util.spec_from_file_location("root_config", root_config_path)
     root_cfg = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(root_cfg)
@@ -85,10 +99,12 @@ def load_config() -> Config:
         review_max_rounds=getattr(root_cfg, "REVIEW_MAX_ROUNDS", 3),
     )
 
-    return Config(
+    _cached_config = Config(
         api=api_cfg,
         pipeline=pipeline_cfg,
         model=getattr(root_cfg, "MODEL", "gpt-4o"),
         temperature=getattr(root_cfg, "TEMPERATURE", 0.7),
         max_tokens=getattr(root_cfg, "MAX_TOKENS", 4096),
     )
+    _config_mtime = current_mtime
+    return _cached_config
