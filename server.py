@@ -25,11 +25,16 @@ Novel2Script API Server
 """
 
 import asyncio
+import atexit
 import json
+import re
 import tempfile
+import threading
+import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from pathlib import Path
 
 import redis as redis_lib
@@ -60,7 +65,22 @@ MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 # WebSocket 连接管理器
 manager = ConnectionManager()
 _executor = ThreadPoolExecutor(max_workers=4)
+atexit.register(_executor.shutdown, wait=False)
 _memory_tasks: dict[str, dict] = {}  # Redis 不可用时内存中跟踪任务状态
+
+_MEMORY_TASKS_MAX = 100
+
+def _memory_tasks_cleanup():
+    """删除已完成/失败的旧任务，保留最近 100 个。"""
+    if len(_memory_tasks) <= _MEMORY_TASKS_MAX:
+        return
+    # 按创建时间排序，删除最旧的多余条目
+    sorted_items = sorted(
+        _memory_tasks.items(),
+        key=lambda kv: kv[1].get("_created_at", 0),
+    )
+    for task_id, _ in sorted_items[:len(sorted_items) - _MEMORY_TASKS_MAX]:
+        del _memory_tasks[task_id]
 
 
 # --- 请求模型 ---
@@ -76,15 +96,23 @@ class ChatRequest(BaseModel):
 
 # --- 工具 ---
 
+def _sanitize_name(filename: str) -> str:
+    """从上传文件名提取安全的目录名，过滤路径遍历字符并限制长度。"""
+    name = Path(filename).stem
+    name = re.sub(r'[\\/:*?"<>|]', '_', name)[:100]
+    return name or "unnamed"
+
+
 def _apply_settings(base: Config, model: str, base_url: str, api_key: str) -> Config:
-    """用用户提供的值覆盖默认配置。"""
+    """用用户提供的值覆盖默认配置（返回独立副本，避免并发竞态）。"""
+    config = deepcopy(base)
     if model:
-        base.model = model
+        config.model = model
     if base_url:
-        base.api.base_url = base_url
+        config.api.base_url = base_url
     if api_key:
-        base.api.api_key = api_key
-    return base
+        config.api.api_key = api_key
+    return config
 
 
 # --- 响应模型 ---
@@ -315,7 +343,7 @@ def convert(
     if len(content) == 0:
         raise HTTPException(status_code=400, detail="文件为空")
 
-    novel_name = Path(file.filename).stem
+    novel_name = _sanitize_name(file.filename)
     with tempfile.NamedTemporaryFile(mode="wb", suffix=".txt", delete=False) as tmp:
         tmp.write(content)
         tmp_path = tmp.name
@@ -353,7 +381,7 @@ def convert_stream(
     if len(content) == 0:
         raise HTTPException(status_code=400, detail="文件为空")
 
-    novel_name = Path(file.filename).stem
+    novel_name = _sanitize_name(file.filename)
     with tempfile.NamedTemporaryFile(mode="wb", suffix=".txt", delete=False) as tmp:
         tmp.write(content)
         tmp_path = tmp.name
@@ -361,6 +389,7 @@ def convert_stream(
     def event_generator():
         import queue
         msg_queue: queue.Queue = queue.Queue()
+        cancel_event = threading.Event()
 
         def progress_callback(step: str, percent: int):
             msg_queue.put({"type": "progress", "step": step, "percent": percent})
@@ -375,6 +404,7 @@ def convert_stream(
                     config,
                     progress_callback=progress_callback,
                     chunk_result_callback=chunk_result_callback,
+                    cancel_event=cancel_event,
                 )
                 script = pipeline.run(tmp_path, novel_name)
                 result = _script_to_response(script, novel_name)
@@ -386,24 +416,28 @@ def convert_stream(
 
         _executor.submit(run_pipeline)
 
-        while True:
-            try:
-                item = msg_queue.get(timeout=600)
-            except Exception:
-                yield f"data: {json.dumps({'type': 'error', 'error': '处理超时'})}\n\n"
-                break
+        try:
+            while True:
+                try:
+                    item = msg_queue.get(timeout=600)
+                except Exception:
+                    cancel_event.set()
+                    yield f"data: {json.dumps({'type': 'error', 'error': '处理超时'})}\n\n"
+                    break
 
-            msg_type = item.get("type")
-            if msg_type == "error":
-                yield f"data: {json.dumps({'type': 'error', 'error': item['error']})}\n\n"
-                break
-            elif msg_type == "done":
-                yield f"data: {json.dumps({'type': 'done', 'result': item['result']}, ensure_ascii=False)}\n\n"
-                break
-            elif msg_type == "chunk_result":
-                yield f"data: {json.dumps({'type': 'chunk_result', 'data': item['data']}, ensure_ascii=False)}\n\n"
-            else:  # progress
-                yield f"data: {json.dumps({'type': 'progress', 'step': item['step'], 'percent': item['percent']})}\n\n"
+                msg_type = item.get("type")
+                if msg_type == "error":
+                    yield f"data: {json.dumps({'type': 'error', 'error': item['error']})}\n\n"
+                    break
+                elif msg_type == "done":
+                    yield f"data: {json.dumps({'type': 'done', 'result': item['result']}, ensure_ascii=False)}\n\n"
+                    break
+                elif msg_type == "chunk_result":
+                    yield f"data: {json.dumps({'type': 'chunk_result', 'data': item['data']}, ensure_ascii=False)}\n\n"
+                else:  # progress
+                    yield f"data: {json.dumps({'type': 'progress', 'step': item['step'], 'percent': item['percent']})}\n\n"
+        finally:
+            cancel_event.set()
 
     return StreamingResponse(
         event_generator(),
@@ -439,7 +473,7 @@ def convert_async(
     if len(content) == 0:
         raise HTTPException(status_code=400, detail="文件为空")
 
-    novel_name = Path(file.filename).stem
+    novel_name = _sanitize_name(file.filename)
     with tempfile.NamedTemporaryFile(mode="wb", suffix=".txt", delete=False) as tmp:
         tmp.write(content)
         tmp_path = tmp.name
@@ -466,8 +500,10 @@ def convert_async(
             }))
         else:
             # 无 Redis：存内存供轮询
+            _memory_tasks_cleanup()
             _memory_tasks[task_id] = {
                 "status": "processing", "step": step, "percent": percent,
+                "_created_at": time.time(),
             }
 
     def run_pipeline():
@@ -490,6 +526,7 @@ def convert_async(
                 _memory_tasks[task_id] = {
                     "status": "done", "step": "done", "percent": 100,
                     "result": result, "novel_name": novel_name,
+                    "_created_at": time.time(),
                 }
         except Exception as e:
             error_msg = f"{type(e).__name__}: {e}"
@@ -507,6 +544,7 @@ def convert_async(
                 _memory_tasks[task_id] = {
                     "status": "failed", "step": "error", "percent": 0,
                     "error": error_msg,
+                    "_created_at": time.time(),
                 }
         finally:
             Path(tmp_path).unlink(missing_ok=True)
@@ -624,4 +662,4 @@ async def http_exception_handler(request, exc):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("server:app", host="127.0.0.1", port=8000, reload=True)

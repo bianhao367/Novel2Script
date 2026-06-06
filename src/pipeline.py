@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from src.config import Config, load_config
-from src.llm_client import LLMClient
+from src.llm_client import LLMClient, LLMError
 from src.parser import (
     Script, Scene, DialogueItem, ActionItem, CharacterInfo,
     parse_yaml, script_to_yaml,
@@ -36,6 +36,7 @@ from src.prompt import (
     build_memory_prompt, build_memory_update_prompt,
     build_review_prompt, build_director_prompt, build_fix_prompt,
     build_orchestrator_prompt, build_dialogue_agent_prompt, build_action_agent_prompt,
+    MEMORY_UPDATE_PROMPT,
 )
 from src.reader import NovelReader
 from src.schema_gen import generate_json_schema, generate_markdown_doc
@@ -56,12 +57,14 @@ class Pipeline:
         config: Config,
         progress_callback: Optional[Callable[[str, int], None]] = None,
         chunk_result_callback: Optional[Callable[[dict], None]] = None,
+        cancel_event: Optional[object] = None,  # threading.Event
     ):
         self.config = config
         self.llm = LLMClient(config)
         self.output_dir = Path(config.pipeline.output_dir)
         self._progress = progress_callback or (lambda step, pct: None)
         self._chunk_result = chunk_result_callback or (lambda data: None)
+        self._cancel_event = cancel_event
 
     def run(self, novel_path: str | Path, novel_name: str | None = None) -> Script:
         """对一部小说执行完整流程：导演预读 → 滑动窗口分块 → 逐块生成 → 多轮审查 → 合并输出。"""
@@ -100,6 +103,9 @@ class Pipeline:
             return Script()
 
         for i, chunk in enumerate(chunks):
+            if self._cancel_event and self._cancel_event.is_set():
+                print(f"\n--- 转换已取消（第 {i+1}/{total_chunks} 块前）---")
+                break
             chunk_idx = i + 1
             base_pct = phase2_start_pct + int(50 * i / total_chunks)
             self._progress("processing", base_pct)
@@ -155,13 +161,17 @@ class Pipeline:
                 return parse_action_script(self.llm.chat(msgs))
 
             def call_memory():
-                msgs = build_memory_update_prompt(
-                    script_fragment_yaml="",  # 无剧本，用原文
-                    current_characters=character_registry,
-                )
-                # 记忆专家用原文而非剧本提取
+                if character_registry:
+                    char_lines = []
+                    for name, info in character_registry.items():
+                        main_tag = "（主角）" if info.get("is_main") else ""
+                        char_lines.append(f"- {name}{main_tag}: {info.get('description', '')}")
+                    char_text = "\n".join(char_lines)
+                else:
+                    char_text = "（暂无）"
+                system_content = MEMORY_UPDATE_PROMPT.format(current_characters=char_text)
                 memory_msgs = [
-                    {"role": "system", "content": msgs[0]["content"]},
+                    {"role": "system", "content": system_content},
                     {"role": "user", "content": (
                         "请根据以下小说片段提取角色信息和剧情摘要：\n\n" + chunk
                     )},
@@ -175,20 +185,20 @@ class Pipeline:
 
                 try:
                     dialogue_script = f_dialogue.result()
-                except ValueError as e:
-                    print(f"  块 {chunk_idx} 对白专家解析失败: {e}")
+                except (ValueError, LLMError) as e:
+                    print(f"  块 {chunk_idx} 对白专家失败: {e}")
                     dialogue_script = DialogueScript(items=[])
 
                 try:
                     action_script = f_action.result()
-                except ValueError as e:
-                    print(f"  块 {chunk_idx} 动作专家解析失败: {e}")
+                except (ValueError, LLMError) as e:
+                    print(f"  块 {chunk_idx} 动作专家失败: {e}")
                     action_script = ActionScript(items=[])
 
                 try:
                     memory_update = f_memory.result()
-                except ValueError as e:
-                    print(f"  块 {chunk_idx} 记忆专家解析失败: {e}")
+                except (ValueError, LLMError) as e:
+                    print(f"  块 {chunk_idx} 记忆专家失败: {e}")
                     memory_update = None
 
             print(f"  专家结果: 对白 {len(dialogue_script.items)} 条, "

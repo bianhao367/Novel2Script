@@ -51,7 +51,6 @@ class LLMClient:
         Args:
             max_tokens: 覆盖 config.max_tokens，用于分析类 Agent（输出短，不需要 4096）。
         """
-        last_error: Exception | None = None
         delay = 2.0  # 初始退避时间（秒）
 
         for attempt in range(3):
@@ -80,7 +79,6 @@ class LLMClient:
                     raise LLMError(f"速率限制，已重试3次仍失败: {e}") from e
 
             except APITimeoutError as e:
-                last_error = e
                 if attempt < 2:
                     print(f"请求超时，{delay:.0f}s 后重试 (第{attempt+1}/3次)...")
                     time.sleep(delay)
@@ -89,7 +87,6 @@ class LLMClient:
                     raise LLMError(f"请求超时，已重试3次仍失败: {e}") from e
 
             except APIConnectionError as e:
-                last_error = e
                 if attempt < 2:
                     print(f"连接失败，{delay:.0f}s 后重试 (第{attempt+1}/3次)...")
                     time.sleep(delay)
@@ -101,12 +98,8 @@ class LLMClient:
                 # 其他 API 错误（非速率/连接/超时/认证），通常不可恢复
                 raise LLMError(f"API 错误: {e}") from e
 
-        # 理论上不会走到这里，但兜底
-        raise LLMError(f"调用失败: {last_error}")
-
     def chat_stream(self, messages: list[dict]):
         """Streaming chat completion，逐个 yield {"type": "reasoning"|"content", "content": str}。"""
-        last_error: Exception | None = None
         delay = 2.0
 
         for attempt in range(3):
@@ -133,7 +126,6 @@ class LLMClient:
                 raise LLMError(f"API 认证失败: {e}") from e
 
             except RateLimitError as e:
-                last_error = e
                 if attempt < 2:
                     print(f"速率限制，{delay:.0f}s 后重试 (第{attempt+1}/3次)...")
                     time.sleep(delay)
@@ -142,7 +134,6 @@ class LLMClient:
                     raise LLMError(f"速率限制，已重试3次: {e}") from e
 
             except APITimeoutError as e:
-                last_error = e
                 if attempt < 2:
                     print(f"请求超时，{delay:.0f}s 后重试 (第{attempt+1}/3次)...")
                     time.sleep(delay)
@@ -151,7 +142,6 @@ class LLMClient:
                     raise LLMError(f"请求超时，已重试3次: {e}") from e
 
             except APIConnectionError as e:
-                last_error = e
                 if attempt < 2:
                     print(f"连接失败，{delay:.0f}s 后重试 (第{attempt+1}/3次)...")
                     time.sleep(delay)
@@ -161,5 +151,3 @@ class LLMClient:
 
             except APIError as e:
                 raise LLMError(f"API 错误: {e}") from e
-
-        raise LLMError(f"调用失败: {last_error}")

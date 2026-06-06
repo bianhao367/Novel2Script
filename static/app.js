@@ -346,7 +346,7 @@ function showToast(message, type = 'info', duration = 3000) {
 
 function loadSettings() {
     try {
-        const saved = localStorage.getItem('novel2script_settings');
+        const saved = sessionStorage.getItem('novel2script_settings');
         if (saved) {
             apiSettings = JSON.parse(saved);
         }
@@ -370,7 +370,7 @@ function saveSettings() {
         api_key: setApiKey.value.trim(),
         model: setModel.value.trim(),
     };
-    localStorage.setItem('novel2script_settings', JSON.stringify(apiSettings));
+    sessionStorage.setItem('novel2script_settings', JSON.stringify(apiSettings));
     closeSettings();
     showToast('设置已保存', 'success');
     checkHealth();
@@ -649,7 +649,7 @@ async function handleSendSSE(aiMsgId) {
                             addAiError(parsed.error, null);
                             showToast(parsed.error, 'error');
                         }
-                    } catch (_) {}
+                    } catch (_) { /* 非 JSON 行，跳过 */ }
                 }
             }
         }
@@ -672,12 +672,14 @@ async function convertStream(formData) {
     const decoder = new TextDecoder();
     let buffer = '';
     let result = null;
+    let streamError = null;
 
     function processLine(line) {
         if (!line.startsWith('data: ')) return;
         const data = JSON.parse(line.slice(6));
 
         if (data.type === 'error') {
+            streamError = data.error;
             throw new Error(data.error);
         }
         if (data.type === 'progress' && data.step) {
@@ -685,7 +687,9 @@ async function convertStream(formData) {
         }
         if (data.type === 'chunk_result' && data.data) {
             scriptChannel.postMessage({ type: 'chunk_result', data: data.data });
-            sentChunks.push({ type: 'chunk_result', data: data.data });
+            if (sentChunks.length < 200) {
+                sentChunks.push({ type: 'chunk_result', data: data.data });
+            }
         }
         if (data.type === 'done') {
             result = data.result;
@@ -701,7 +705,7 @@ async function convertStream(formData) {
             if (done) {
                 // 流结束，处理 buffer 中残留的最后一行
                 if (buffer.trim()) {
-                    try { processLine(buffer.trim()); } catch (_) {}
+                    try { processLine(buffer.trim()); } catch (_) { /* 末尾残留不完整行 */ }
                 }
                 break;
             }
@@ -724,7 +728,7 @@ async function convertStream(formData) {
     }
 
     if (!result) {
-        throw new Error('转换未返回结果');
+        throw new Error(streamError || '转换未返回结果');
     }
     return result;
 }
