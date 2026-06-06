@@ -60,6 +60,7 @@ const setModel      = document.getElementById('setModel');
 let selectedFile = null;
 let conversationHistory = [];
 let scriptContext = '';
+let currentNovelName = '';
 let isConnected = false;
 
 // BroadcastChannel 用于与独立剧本窗口通信
@@ -433,6 +434,7 @@ function clearConversation() {
 
     conversationHistory = [];
     scriptContext = '';
+    currentNovelName = '';
     exportBtn.disabled = true;
 
     // 移除所有消息，保留欢迎页
@@ -441,19 +443,25 @@ function clearConversation() {
     showToast('对话已清空', 'info');
 }
 
-function exportScript() {
-    if (!scriptContext) {
+async function exportScript() {
+    if (!currentNovelName) {
         showToast('没有可导出的剧本', 'error');
         return;
     }
-    const blob = new Blob([scriptContext], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'script.json';
-    a.click();
-    URL.revokeObjectURL(url);
-    showToast('剧本已导出', 'success');
+    try {
+        const res = await fetch(`/api/v1/download/${encodeURIComponent(currentNovelName)}`);
+        if (!res.ok) throw new Error('下载失败');
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${currentNovelName}.yaml`;
+        a.click();
+        URL.revokeObjectURL(url);
+        showToast('剧本已导出', 'success');
+    } catch (e) {
+        showToast('下载失败: ' + e.message, 'error');
+    }
 }
 
 // ====== 字数统计 ======
@@ -538,6 +546,7 @@ async function handleSend() {
                     scenes: data.scenes,
                     characters: data.characters,
                 }, null, 2);
+                currentNovelName = data.novel_name || '';
                 exportBtn.disabled = false;
                 conversationHistory.push({ role: 'user', content: displayText });
                 conversationHistory.push({

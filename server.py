@@ -61,6 +61,7 @@ app = FastAPI(
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+_output_dir = Path(load_config().pipeline.output_dir)
 
 # WebSocket 连接管理器
 manager = ConnectionManager()
@@ -646,6 +647,20 @@ def chat(req: ChatRequest):
 @app.get("/api/v1/schema")
 def get_schema():
     return SCRIPT_SCHEMA.model_json_schema()
+
+
+@app.get("/api/v1/download/{novel_name}")
+def download_script(novel_name: str):
+    """下载已生成的 YAML 剧本文件。"""
+    safe_name = re.sub(r'[\\/:*?"<>|]', '_', novel_name)[:100]
+    yaml_path = _output_dir / safe_name / f"{safe_name}.yaml"
+    if not yaml_path.exists():
+        raise HTTPException(status_code=404, detail="剧本文件不存在")
+    return FileResponse(
+        yaml_path,
+        media_type="application/x-yaml",
+        filename=f"{safe_name}.yaml",
+    )
 
 
 # --- 全局异常处理 ---
