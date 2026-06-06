@@ -41,6 +41,24 @@ from src.reader import NovelReader
 from src.schema_gen import generate_json_schema, generate_markdown_doc
 
 
+_MEMORY_CHAR_THRESHOLD = 40  # 角色数超过此值时压缩次要角色
+
+
+def _compress_registry(registry: dict[str, dict]) -> None:
+    """压缩角色注册表：主要角色保留完整描述，次要角色截断。"""
+    if len(registry) <= _MEMORY_CHAR_THRESHOLD:
+        return
+    main_count = 0
+    compressed = 0
+    for name, info in registry.items():
+        if info.get("is_main"):
+            main_count += 1
+        elif len(info.get("description", "")) > 80:
+            info["description"] = info["description"][:77] + "..."
+            compressed += 1
+    print(f"  角色注册表压缩: {main_count} 主角保留完整, {compressed} 次要角色截断描述")
+
+
 class Pipeline:
     """编排小说到剧本的完整转换流程。
 
@@ -101,9 +119,20 @@ class Pipeline:
             self._progress("done", 100)
             return Script()
 
-        chunk_executor = ThreadPoolExecutor(max_workers=2)
+        chunk_executor = ThreadPoolExecutor(max_workers=3)
+
+        def _submit_orchestrator(chunk_text: str, registry: dict, scene_num: int):
+            """提交编排 Agent 到线程池（传 registry 副本避免竞态）。"""
+            return chunk_executor.submit(
+                self._call_orchestrator, chunk_text, dict(registry), scene_num,
+            )
+
+        # 预取第一块的编排结果
+        prefetch_future = _submit_orchestrator(chunks[0], character_registry, next_scene_number)
+
         for i, chunk in enumerate(chunks):
             if self._cancel_event and self._cancel_event.is_set():
+                prefetch_future.cancel()
                 print(f"\n--- 转换已取消（第 {i+1}/{total_chunks} 块前）---")
                 break
             chunk_idx = i + 1
@@ -111,9 +140,15 @@ class Pipeline:
             self._progress("processing", base_pct)
             print(f"\n--- 处理第 {chunk_idx}/{total_chunks} 块 ({len(chunk)} 字符) ---")
 
-            # ---- Step 1: 编排 Agent ----
+            # ---- Step 1: 取编排结果 + 预取下一块 ----
             self._progress("orchestrating", base_pct + 1)
-            outline = self._call_orchestrator(chunk, character_registry, next_scene_number)
+            outline = prefetch_future.result()
+
+            # 预取下一块的编排（与当前块的专家/审查并行）
+            if i + 1 < total_chunks:
+                prefetch_future = _submit_orchestrator(
+                    chunks[i + 1], character_registry, next_scene_number,
+                )
 
             if not outline.scenes:
                 print(f"  块 {chunk_idx} 编排结果为空，跳过")
@@ -188,14 +223,6 @@ class Pipeline:
             raw_path = novel_dir / f"raw_chunk_{chunk_idx}.txt"
             raw_path.write_text(raw_output, encoding="utf-8")
 
-            # ---- Step 3.5: 记忆专家 (用剧本 YAML 而非原文) ----
-            try:
-                memory_msgs = build_memory_update_prompt(raw_output, character_registry)
-                memory_update = parse_memory_update(self.llm.chat(memory_msgs, max_tokens=2048))
-            except (ValueError, LLMError) as e:
-                print(f"  块 {chunk_idx} 记忆专家失败: {e}")
-                memory_update = None
-
             # ---- Step 4: 多轮审查闭环 ----
             raw_output_before_review = raw_output
             script_fragment_before_review = script_fragment
@@ -246,6 +273,14 @@ class Pipeline:
 
             raw_path.write_text(raw_output, encoding="utf-8")
 
+            # ---- Step 4.5: 记忆专家 (用审查后的最终 YAML) ----
+            try:
+                memory_msgs = build_memory_update_prompt(raw_output, character_registry)
+                memory_update = parse_memory_update(self.llm.chat(memory_msgs, max_tokens=2048))
+            except (ValueError, LLMError) as e:
+                print(f"  块 {chunk_idx} 记忆专家失败: {e}")
+                memory_update = None
+
             # 更新场景编号
             if script_fragment.scenes:
                 next_scene_number = max(s.scene_number for s in script_fragment.scenes) + 1
@@ -292,6 +327,8 @@ class Pipeline:
 
                 print(f"  记忆更新: {len(memory_update.characters)} 角色, "
                       f"事件: {memory_update.event_summary[:60]}...")
+
+            _compress_registry(character_registry)
 
         chunk_executor.shutdown(wait=True)
 
