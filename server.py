@@ -92,18 +92,38 @@ def _script_to_response(script, novel_name: str) -> dict:
     return script_to_response(script, novel_name)
 
 
-# --- Redis 辅助 ---
+# --- Redis 连接池（单例，启动时初始化一次） ---
 
-def _get_redis():
-    """返回 Redis 连接，不可用时返回 None。"""
+_redis_pool: redis_lib.Redis | None = None
+_redis_pool_initialized = False
+
+
+def _get_redis() -> redis_lib.Redis | None:
+    """返回 Redis 连接池客户端，不可用时返回 None。
+
+    首次调用时创建连接池并验证连通性，后续调用直接复用。
+    使用 ConnectionPool 避免每次请求新建 TCP 连接。
+    """
+    global _redis_pool, _redis_pool_initialized
+    if _redis_pool_initialized:
+        return _redis_pool
+
     config = load_config()
     if not config.redis.enabled:
+        _redis_pool_initialized = True
         return None
+
     try:
-        r = redis_lib.Redis.from_url(config.redis.url)
-        r.ping()
-        return r
+        _redis_pool = redis_lib.Redis.from_url(
+            config.redis.url,
+            decode_responses=False,
+            max_connections=10,
+        )
+        _redis_pool.ping()
+        _redis_pool_initialized = True
+        return _redis_pool
     except Exception:
+        _redis_pool_initialized = True
         return None
 
 

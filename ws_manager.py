@@ -36,16 +36,30 @@ class ConnectionManager:
         self._client_tasks: dict[str, set[str]] = {}     # client_id -> {task_id, ...}
         self._pubsub_listeners: dict[str, asyncio.Task] = {}  # task_id -> Task
         self._lock = asyncio.Lock()
+        self._redis: redis_lib.Redis | None = None
+        self._redis_initialized = False
 
     def _get_redis(self):
+        """返回 Redis 连接池客户端（单例），不可用时返回 None。"""
+        if self._redis_initialized:
+            return self._redis
+
         config = load_config()
         if not config.redis.enabled:
+            self._redis_initialized = True
             return None
+
         try:
-            r = redis_lib.Redis.from_url(config.redis.url)
-            r.ping()
-            return r
+            self._redis = redis_lib.Redis.from_url(
+                config.redis.url,
+                decode_responses=False,
+                max_connections=10,
+            )
+            self._redis.ping()
+            self._redis_initialized = True
+            return self._redis
         except Exception:
+            self._redis_initialized = True
             return None
 
     async def connect(self, websocket: WebSocket, client_id: str):

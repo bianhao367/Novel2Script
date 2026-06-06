@@ -68,6 +68,31 @@ class NovelReader:
 
         return chunks
 
+    def chunks_with_overlap(self, size: int, overlap: int) -> list[str]:
+        """按大约 size 字符分块，相邻块之间有 overlap 字符的重叠。
+
+        重叠区域从上一块的末尾取，对齐到最近的段落边界（\\n\\n）。
+        当 overlap=0 时行为等同于 chunks(size)。
+        """
+        base_chunks = self.chunks(size)
+        if overlap <= 0 or len(base_chunks) <= 1:
+            return base_chunks
+
+        result: list[str] = [base_chunks[0]]
+        for i in range(1, len(base_chunks)):
+            prev = base_chunks[i - 1]
+            if len(prev) > overlap:
+                overlap_text = prev[-overlap:]
+                # 对齐到最近的段落边界，避免在段落中间截断
+                nl_pos = overlap_text.find("\n\n")
+                if nl_pos != -1:
+                    overlap_text = overlap_text[nl_pos + 2:]
+                result.append(overlap_text + "\n\n" + base_chunks[i])
+            else:
+                result.append(prev + "\n\n" + base_chunks[i])
+
+        return result
+
     @property
     def char_count(self) -> int:
         """小说总字符数。"""
