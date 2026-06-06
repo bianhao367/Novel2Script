@@ -1,9 +1,11 @@
 """Novel2Script API —— 将小说 .txt 文件转换为结构化剧本的 HTTP 服务。"""
 
+import asyncio
 import json
 import tempfile
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import redis as redis_lib
@@ -12,12 +14,14 @@ from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from rq import Queue
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from src.config import Config, ApiConfig, PipelineConfig, load_config
 from src.llm_client import LLMError, LLMClient
 from src.parser import SCRIPT_SCHEMA
 from src.pipeline import Pipeline
 from src.response import script_to_response
+from ws_manager import ConnectionManager
 
 app = FastAPI(
     title="Novel2Script",
@@ -28,6 +32,10 @@ app = FastAPI(
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+
+# WebSocket 连接管理器
+manager = ConnectionManager()
+_executor = ThreadPoolExecutor(max_workers=4)
 
 
 # --- 请求模型 ---
@@ -92,6 +100,128 @@ def health():
         "model": config.model,
         "base_url": config.api.base_url,
     }
+
+
+# --- WebSocket 端点 ---
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    client_id = str(uuid.uuid4())
+    await manager.connect(websocket, client_id)
+
+    # 发送初始健康信息
+    config = load_config()
+    await manager.send_to_client(client_id, {
+        "type": "health",
+        "model": config.model,
+        "base_url": config.api.base_url,
+    })
+
+    # 启动心跳
+    heartbeat_task = asyncio.create_task(_heartbeat_loop(client_id))
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+            action = data.get("action")
+            if action == "chat":
+                asyncio.create_task(_handle_ws_chat(client_id, data))
+            elif action == "subscribe_task":
+                await manager.subscribe_task(client_id, data["task_id"])
+            elif action == "unsubscribe_task":
+                await manager.unsubscribe_task(client_id, data["task_id"])
+            elif action == "pong":
+                pass
+            else:
+                await manager.send_to_client(client_id, {
+                    "type": "error",
+                    "message": f"Unknown action: {action}",
+                })
+    except WebSocketDisconnect:
+        pass
+    finally:
+        heartbeat_task.cancel()
+        await manager.disconnect(client_id)
+
+
+async def _heartbeat_loop(client_id: str, interval: int = 30):
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await manager.send_to_client(client_id, {"type": "ping"})
+        except Exception:
+            break
+
+
+async def _handle_ws_chat(client_id: str, data: dict):
+    """WebSocket 聊天处理，流式推送 chunk。"""
+    request_id = data.get("request_id", "")
+    try:
+        config = _apply_settings(
+            load_config(),
+            data.get("model", ""),
+            data.get("base_url", ""),
+            data.get("api_key", ""),
+        )
+        llm = LLMClient(config)
+
+        system_msg = "你是一个专业的编剧助手。你可以帮助用户打磨剧本、修改对白、调整情节结构。请用中文回答。"
+        if data.get("script_context"):
+            system_msg += f"\n\n当前剧本上下文：\n{data['script_context']}"
+
+        messages = [{"role": "system", "content": system_msg}] + data["messages"]
+
+        # chat_stream 是同步生成器，用线程池 + Queue 避免阻塞事件循环
+        queue = asyncio.Queue()
+        loop = asyncio.get_event_loop()
+
+        def _produce():
+            try:
+                for chunk in llm.chat_stream(messages):
+                    asyncio.run_coroutine_threadsafe(queue.put(chunk), loop)
+            except Exception as e:
+                asyncio.run_coroutine_threadsafe(queue.put(e), loop)
+            finally:
+                asyncio.run_coroutine_threadsafe(queue.put(None), loop)
+
+        _executor.submit(_produce)
+
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                await manager.send_to_client(client_id, {
+                    "type": "chat_error",
+                    "request_id": request_id,
+                    "error": str(item),
+                })
+                return
+            await manager.send_to_client(client_id, {
+                "type": "chat_chunk",
+                "request_id": request_id,
+                "chunk_type": item["type"],
+                "content": item["content"],
+            })
+
+        await manager.send_to_client(client_id, {
+            "type": "chat_done",
+            "request_id": request_id,
+        })
+
+    except LLMError as e:
+        await manager.send_to_client(client_id, {
+            "type": "chat_error",
+            "request_id": request_id,
+            "error": str(e),
+        })
+    except Exception as e:
+        traceback.print_exc()
+        await manager.send_to_client(client_id, {
+            "type": "chat_error",
+            "request_id": request_id,
+            "error": f"服务器内部错误: {e}",
+        })
 
 
 @app.post("/api/v1/convert")

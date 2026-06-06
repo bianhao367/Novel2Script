@@ -51,11 +51,158 @@ let apiSettings = {
     model: '',
 };
 
+// ====== WebSocket 管理 ======
+let ws = null;
+let wsReady = false;
+let wsReconnectAttempts = 0;
+const WS_MAX_RECONNECT = 5;
+const WS_RECONNECT_BASE_DELAY = 1000;
+
+const pendingChatRequests = new Map();  // request_id -> {streamingId, fullContent, fullReasoning}
+const activeTasks = new Set();
+const taskResolvers = new Map();        // task_id -> {resolve, reject}
+
+function connectWebSocket() {
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = `${protocol}//${location.host}/ws`;
+
+    ws = new WebSocket(url);
+
+    ws.onopen = () => {
+        wsReady = true;
+        wsReconnectAttempts = 0;
+        for (const taskId of activeTasks) {
+            wsSend({ action: 'subscribe_task', task_id: taskId });
+        }
+    };
+
+    ws.onmessage = (event) => {
+        handleWsMessage(JSON.parse(event.data));
+    };
+
+    ws.onclose = () => {
+        wsReady = false;
+        setConnectionStatus(false, '连接断开');
+        scheduleReconnect();
+    };
+
+    ws.onerror = () => {};
+}
+
+function wsSend(obj) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(obj));
+    }
+}
+
+function scheduleReconnect() {
+    if (wsReconnectAttempts >= WS_MAX_RECONNECT) {
+        setConnectionStatus(false, '无法连接，已降级');
+        checkHealth();
+        return;
+    }
+    const delay = WS_RECONNECT_BASE_DELAY * Math.pow(2, wsReconnectAttempts);
+    wsReconnectAttempts++;
+    setTimeout(connectWebSocket, delay);
+}
+
+function handleWsMessage(msg) {
+    switch (msg.type) {
+        case 'ping':
+            wsSend({ action: 'pong' });
+            break;
+
+        case 'health':
+            setConnectionStatus(true, `已连接 · ${msg.model || ''}`);
+            break;
+
+        case 'chat_chunk': {
+            const pending = pendingChatRequests.get(msg.request_id);
+            if (!pending) return;
+            if (msg.chunk_type === 'reasoning') {
+                pending.fullReasoning += msg.content;
+                updateThinkingContent(pending.streamingId, pending.fullReasoning);
+            } else if (msg.chunk_type === 'content') {
+                pending.fullContent += msg.content;
+                updateAiStreaming(pending.streamingId, pending.fullContent);
+            }
+            break;
+        }
+
+        case 'chat_done': {
+            const pending = pendingChatRequests.get(msg.request_id);
+            if (!pending) return;
+            finalizeAiStreaming(pending.streamingId);
+            conversationHistory.push({ role: 'assistant', content: pending.fullContent });
+            pendingChatRequests.delete(msg.request_id);
+            setSending(false);
+            resetInput();
+            break;
+        }
+
+        case 'chat_error': {
+            const pending = pendingChatRequests.get(msg.request_id);
+            if (pending) {
+                removeMessage(pending.streamingId);
+                pendingChatRequests.delete(msg.request_id);
+            }
+            conversationHistory.pop();
+            addAiError(msg.error, null);
+            showToast('请求失败', 'error');
+            setSending(false);
+            resetInput();
+            break;
+        }
+
+        case 'task_progress':
+            updateAiProgress('msg-progress-' + msg.task_id, msg.step, msg.percent);
+            break;
+
+        case 'task_done': {
+            activeTasks.delete(msg.task_id);
+            removeMessage('msg-progress-' + msg.task_id);
+            const resolver = taskResolvers.get(msg.task_id);
+            if (resolver) {
+                resolver.resolve(msg.result);
+                taskResolvers.delete(msg.task_id);
+            }
+            break;
+        }
+
+        case 'task_failed': {
+            activeTasks.delete(msg.task_id);
+            removeMessage('msg-progress-' + msg.task_id);
+            const resolver = taskResolvers.get(msg.task_id);
+            if (resolver) {
+                resolver.reject(new Error(msg.error || '转换失败'));
+                taskResolvers.delete(msg.task_id);
+            }
+            break;
+        }
+
+        case 'error':
+            showToast(msg.message, 'error');
+            break;
+    }
+}
+
+function resetInput() {
+    textInput.value = '';
+    autoResizeTextarea();
+    updateCharCount();
+    clearFile();
+    textInput.focus();
+}
+
 // ====== 初始化 ======
 document.addEventListener('DOMContentLoaded', () => {
     loadSettings();
     bindEvents();
-    checkHealth();
+    connectWebSocket();
+    // WS 连接失败时降级到 HTTP 健康检查
+    setTimeout(() => {
+        if (!wsReady) checkHealth();
+    }, 3000);
 });
 
 function bindEvents() {
@@ -268,30 +415,24 @@ async function handleSend() {
 
     if (!hasFile && !hasText) return;
 
-    // 隐藏欢迎页
     if (welcome) welcome.style.display = 'none';
 
-    // 构建用户消息的显示文本
     let displayText = text;
     if (hasFile) {
         const fileLabel = `[上传了文件: ${selectedFile.name} (${formatSize(selectedFile.size)})]`;
         displayText = text ? `${fileLabel}\n\n${text}` : `${fileLabel}\n请将这部小说转换为剧本。`;
     }
 
-    // 显示用户消息
     addUserMessage(displayText, hasFile);
     scrollToBottom();
-
-    // 禁用输入
     setSending(true);
 
-    // 显示 AI 加载动画
     const aiMsgId = addAiLoading();
     scrollToBottom();
 
     try {
         if (hasFile) {
-            // --- 文件模式：优先异步，Redis 不可用时降级同步 ---
+            // --- 文件模式：HTTP 提交 + WS 推送进度 ---
             const formData = new FormData();
             formData.append('file', selectedFile);
             const api = getApiParams();
@@ -302,7 +443,7 @@ async function handleSend() {
             removeMessage(aiMsgId);
 
             try {
-                const data = await convertAsync(formData);
+                const data = await convertAsyncWs(formData);
                 scriptContext = JSON.stringify({
                     title: data.title,
                     scenes: data.scenes,
@@ -320,111 +461,142 @@ async function handleSend() {
                 addAiError(e.message, null);
                 showToast('转换失败', 'error');
             }
+            setSending(false);
+            resetInput();
         } else {
-            // --- 文本模式：调用 /api/v1/chat (SSE 流式) ---
+            // --- 文本模式：WS 优先，SSE 降级 ---
             conversationHistory.push({ role: 'user', content: text });
 
-            const res = await fetch('/api/v1/chat', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
+            if (wsReady) {
+                removeMessage(aiMsgId);
+                const requestId = crypto.randomUUID();
+                const streamingId = addAiStreaming(showThinking.checked ? '思考' : null);
+
+                pendingChatRequests.set(requestId, {
+                    streamingId,
+                    fullContent: '',
+                    fullReasoning: '',
+                });
+
+                wsSend({
+                    action: 'chat',
+                    request_id: requestId,
                     messages: conversationHistory,
                     script_context: scriptContext,
-                    stream: true,
                     ...getApiParams(),
-                }),
-            });
-
-            removeMessage(aiMsgId);
-
-            if (!res.ok) {
-                const err = await res.json();
-                const detail = err.error || err.detail || `HTTP ${res.status}`;
-                conversationHistory.pop();
-                addAiError(detail, showThinking.checked ? JSON.stringify(err, null, 2) : null);
-                showToast('请求失败', 'error');
+                });
+                // handleWsMessage 中的 chat_done/chat_error 会处理后续
             } else {
-                // 流式读取 SSE 事件流
-                const streamingId = addAiStreaming(showThinking.checked ? '思考' : null);
-                const reader = res.body.getReader();
-                const decoder = new TextDecoder();
-                let fullContent = '';
-                let fullReasoning = '';
-                let readerDone = false;
-                let buffer = '';
-
-                while (!readerDone) {
-                    const { done, value } = await reader.read();
-                    readerDone = done;
-                    if (value) {
-                        buffer += decoder.decode(value, { stream: !done });
-                        const lines = buffer.split('\n');
-                        buffer = lines.pop() || '';
-                        for (const line of lines) {
-                            if (line.startsWith('data: ')) {
-                                const payload = line.slice(6);
-                                if (payload === '[DONE]') continue;
-                                try {
-                                    const parsed = JSON.parse(payload);
-                                    if (parsed.type === 'reasoning') {
-                                        fullReasoning += parsed.content;
-                                        updateThinkingContent(streamingId, fullReasoning);
-                                    } else if (parsed.type === 'content') {
-                                        fullContent += parsed.content;
-                                        updateAiStreaming(streamingId, fullContent);
-                                    } else if (parsed.error) {
-                                        conversationHistory.pop();
-                                        addAiError(parsed.error, null);
-                                        showToast(parsed.error, 'error');
-                                    }
-                                } catch (_) { /* 忽略不完整的 JSON 行 */ }
-                            }
-                        }
-                    }
-                }
-
-                finalizeAiStreaming(streamingId);
-                conversationHistory.push({ role: 'assistant', content: fullContent });
+                await handleSendSSE(aiMsgId);
+                setSending(false);
+                resetInput();
             }
         }
     } catch (err) {
         removeMessage(aiMsgId);
         addAiError(`网络错误: ${err.message}`, null);
         showToast('网络错误', 'error');
+        setSending(false);
+        resetInput();
     }
 
     scrollToBottom();
-    setSending(false);
-
-    // 重置状态
-    textInput.value = '';
-    autoResizeTextarea();
-    updateCharCount();
-    clearFile();
-    textInput.focus();
 }
 
-// ====== 异步转换（提交→轮询） ======
-
-async function convertAsync(formData) {
-    // 先尝试异步模式
-    const submitRes = await fetch('/api/v1/convert/async', {
+/** SSE 降级方案 */
+async function handleSendSSE(aiMsgId) {
+    const res = await fetch('/api/v1/chat', {
         method: 'POST',
-        body: formData,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            messages: conversationHistory,
+            script_context: scriptContext,
+            stream: true,
+            ...getApiParams(),
+        }),
     });
 
-    if (!submitRes.ok) {
-        // 503 = Redis 不可用，降级到同步模式
-        if (submitRes.status === 503) {
-            return await convertSync(formData);
+    removeMessage(aiMsgId);
+
+    if (!res.ok) {
+        const err = await res.json();
+        const detail = err.error || err.detail || `HTTP ${res.status}`;
+        conversationHistory.pop();
+        addAiError(detail, showThinking.checked ? JSON.stringify(err, null, 2) : null);
+        showToast('请求失败', 'error');
+        return;
+    }
+
+    const streamingId = addAiStreaming(showThinking.checked ? '思考' : null);
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let fullContent = '';
+    let fullReasoning = '';
+    let readerDone = false;
+    let buffer = '';
+
+    while (!readerDone) {
+        const { done, value } = await reader.read();
+        readerDone = done;
+        if (value) {
+            buffer += decoder.decode(value, { stream: !done });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    const payload = line.slice(6);
+                    if (payload === '[DONE]') continue;
+                    try {
+                        const parsed = JSON.parse(payload);
+                        if (parsed.type === 'reasoning') {
+                            fullReasoning += parsed.content;
+                            updateThinkingContent(streamingId, fullReasoning);
+                        } else if (parsed.type === 'content') {
+                            fullContent += parsed.content;
+                            updateAiStreaming(streamingId, fullContent);
+                        } else if (parsed.error) {
+                            conversationHistory.pop();
+                            addAiError(parsed.error, null);
+                            showToast(parsed.error, 'error');
+                        }
+                    } catch (_) {}
+                }
+            }
         }
+    }
+
+    finalizeAiStreaming(streamingId);
+    conversationHistory.push({ role: 'assistant', content: fullContent });
+}
+
+// ====== 异步转换（WS 推送 + 轮询降级） ======
+
+async function convertAsyncWs(formData) {
+    const submitRes = await fetch('/api/v1/convert/async', { method: 'POST', body: formData });
+
+    if (!submitRes.ok) {
+        if (submitRes.status === 503) return await convertSync(formData);
         const err = await submitRes.json();
         throw new Error(err.detail || err.error || `HTTP ${submitRes.status}`);
     }
 
     const { task_id, novel_name } = await submitRes.json();
-    const progressId = addAiProgress(`正在转换: ${novel_name}`);
+    addAiProgressWithId('msg-progress-' + task_id, `正在转换: ${novel_name}`);
 
+    if (wsReady) {
+        activeTasks.add(task_id);
+        wsSend({ action: 'subscribe_task', task_id: task_id });
+        return new Promise((resolve, reject) => {
+            taskResolvers.set(task_id, { resolve, reject });
+        });
+    } else {
+        return await convertAsyncPolling(task_id);
+    }
+}
+
+/** 轮询降级方案 */
+async function convertAsyncPolling(task_id) {
+    const progressId = 'msg-progress-' + task_id;
     while (true) {
         await sleep(2000);
         const pollRes = await fetch(`/api/v1/tasks/${task_id}`);
@@ -447,10 +619,7 @@ async function convertAsync(formData) {
 }
 
 async function convertSync(formData) {
-    const res = await fetch('/api/v1/convert', {
-        method: 'POST',
-        body: formData,
-    });
+    const res = await fetch('/api/v1/convert', { method: 'POST', body: formData });
     if (!res.ok) {
         const err = await res.json();
         throw new Error(err.detail || err.error || `HTTP ${res.status}`);
@@ -653,6 +822,11 @@ function thinkingBoxHtml(id, label, content) {
 /** 进度条消息气泡 */
 function addAiProgress(label) {
     const id = 'msg-progress-' + Date.now();
+    addAiProgressWithId(id, label);
+    return id;
+}
+
+function addAiProgressWithId(id, label) {
     const html = `
         <div class="message ai" id="${id}">
             <div class="message-avatar">AI</div>
@@ -670,7 +844,6 @@ function addAiProgress(label) {
         </div>`;
     chatArea.insertAdjacentHTML('beforeend', html);
     scrollToBottom();
-    return id;
 }
 
 function updateAiProgress(msgId, step, percent) {
