@@ -1,4 +1,22 @@
-"""WebSocket 连接管理器 —— 管理连接、任务订阅、Redis Pub/Sub 监听。"""
+"""
+WebSocket 连接管理器
+====================
+管理所有 WebSocket 连接及其任务订阅，负责：
+- 连接生命周期管理（connect / disconnect）
+- 任务进度订阅（subscribe_task / unsubscribe_task）
+- Redis Pub/Sub 监听：将 worker 的进度消息实时推送给前端
+
+架构：
+- 每个客户端连接分配唯一 client_id
+- 一个客户端可订阅多个任务，一个任务可被多个客户端订阅
+- 任务完成/失败时自动清理订阅并停止 Redis 监听
+- 使用 asyncio.Lock 保护并发访问
+
+使用方式（在 server.py 中）：
+    manager = ConnectionManager()
+    await manager.connect(websocket, client_id)
+    await manager.subscribe_task(client_id, task_id)
+"""
 
 import asyncio
 import json
@@ -31,12 +49,17 @@ class ConnectionManager:
             return None
 
     async def connect(self, websocket: WebSocket, client_id: str):
+        """接受 WebSocket 连接并注册到管理器。"""
         await websocket.accept()
         async with self._lock:
             self._connections[client_id] = websocket
             self._client_tasks[client_id] = set()
 
     async def disconnect(self, client_id: str):
+        """断开连接，清理该客户端的所有订阅。
+
+        如果某个任务的最后一个订阅者断开，同时取消 Redis Pub/Sub 监听。
+        """
         async with self._lock:
             tasks = self._client_tasks.pop(client_id, set())
             self._connections.pop(client_id, None)
@@ -44,7 +67,7 @@ class ConnectionManager:
                 subs = self._task_subs.get(task_id)
                 if subs:
                     subs.discard(client_id)
-                    if not subs:
+                    if not subs:  # 最后一个订阅者断开
                         del self._task_subs[task_id]
                         listener = self._pubsub_listeners.pop(task_id, None)
                         if listener:
@@ -82,7 +105,12 @@ class ConnectionManager:
                 client_tasks.discard(task_id)
 
     async def _pubsub_listener(self, task_id: str):
-        """监听 Redis Pub/Sub channel，将消息推送给订阅的客户端。"""
+        """监听 Redis Pub/Sub channel，将消息推送给订阅的客户端。
+
+        每个任务对应一个独立的 listener asyncio.Task。
+        使用 run_in_executor 避免 Redis 阻塞读取阻塞事件循环。
+        任务完成/失败后自动清理订阅并退出。
+        """
         r = self._get_redis()
         if not r:
             return
@@ -99,9 +127,11 @@ class ConnectionManager:
                     data = json.loads(msg["data"])
                     status = data.get("status", "")
 
+                    # 获取当前订阅者快照，避免长时间持锁
                     async with self._lock:
                         subscribers = set(self._task_subs.get(task_id, set()))
 
+                    # 按状态类型推送给所有订阅者
                     for cid in subscribers:
                         if status == "done":
                             await self.send_to_client(cid, {
@@ -123,7 +153,7 @@ class ConnectionManager:
                                 "percent": data.get("percent", 0),
                             })
 
-                    # 任务结束，清理订阅
+                    # 任务结束，清理所有订阅并退出 listener
                     if status in ("done", "failed"):
                         async with self._lock:
                             for cid in subscribers:
@@ -134,7 +164,7 @@ class ConnectionManager:
                             self._pubsub_listeners.pop(task_id, None)
                         break
 
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.1)  # 避免忙等
         except asyncio.CancelledError:
             pass
         finally:

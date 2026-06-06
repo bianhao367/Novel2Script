@@ -1,4 +1,16 @@
-"""Prompt 构造器 —— 为小说转剧本任务构建 LLM 对话 prompt。"""
+"""
+Prompt 构造器
+=============
+为小说转剧本任务构建 LLM 对话 prompt。
+
+SYSTEM_PROMPT 定义了 LLM 的角色（专业编剧）和输出格式（严格 YAML），
+包括详细的字段说明和核心规则。build_prompt() 将系统提示与小说文本
+组装为 OpenAI chat completion 格式的消息列表。
+
+使用方式：
+    messages = build_prompt(novel_text)
+    response = llm.chat(messages)
+"""
 
 SYSTEM_PROMPT = """\
 你是一名专业编剧。你的任务是将小说片段转换为结构化的 YAML 格式剧本。

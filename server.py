@@ -1,4 +1,28 @@
-"""Novel2Script API —— 将小说 .txt 文件转换为结构化剧本的 HTTP 服务。"""
+"""
+Novel2Script API Server
+=======================
+将小说 .txt 文件转换为结构化剧本的 HTTP + WebSocket 服务。
+
+架构：
+- FastAPI 应用，提供 REST API 和 WebSocket 双通道
+- WebSocket 用于实时聊天流式输出和异步任务进度推送
+- Redis + rq 实现异步任务队列（可选，降级到同步模式）
+- SSE 作为 WebSocket 的降级方案
+
+端点：
+- GET  /                     前端页面
+- GET  /api/v1/health        健康检查
+- POST /api/v1/chat          AI 对话（SSE 流式）
+- POST /api/v1/convert       同步文件转换
+- POST /api/v1/convert/async 异步文件转换（需 Redis）
+- GET  /api/v1/tasks/{id}    查询异步任务状态
+- GET  /api/v1/schema        获取剧本 JSON Schema
+- WS   /ws                   WebSocket 双向通信
+
+启动方式：
+    python server.py
+    # 或 uvicorn server:app --reload
+"""
 
 import asyncio
 import json
@@ -106,10 +130,28 @@ def health():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket 主端点，处理所有客户端连接。
+
+    消息协议（客户端→服务端）：
+    - {action: "chat", request_id, messages, script_context, model, base_url, api_key}
+    - {action: "subscribe_task", task_id}
+    - {action: "unsubscribe_task", task_id}
+    - {action: "pong"}  —— 回复服务端的心跳 ping
+
+    消息协议（服务端→客户端）：
+    - {type: "chat_chunk", request_id, chunk_type, content}
+    - {type: "chat_done", request_id}
+    - {type: "chat_error", request_id, error}
+    - {type: "task_progress", task_id, step, percent}
+    - {type: "task_done", task_id, result}
+    - {type: "task_failed", task_id, error}
+    - {type: "ping"}
+    - {type: "health", model, base_url}
+    """
     client_id = str(uuid.uuid4())
     await manager.connect(websocket, client_id)
 
-    # 发送初始健康信息
+    # 连接建立后立即发送健康信息，前端据此显示当前模型
     config = load_config()
     await manager.send_to_client(client_id, {
         "type": "health",
@@ -117,7 +159,7 @@ async def websocket_endpoint(websocket: WebSocket):
         "base_url": config.api.base_url,
     })
 
-    # 启动心跳
+    # 启动心跳循环，每 30 秒发一次 ping，客户端需回 pong
     heartbeat_task = asyncio.create_task(_heartbeat_loop(client_id))
 
     try:
@@ -125,13 +167,15 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive_json()
             action = data.get("action")
             if action == "chat":
+                # 异步处理聊天，不阻塞消息接收循环
                 asyncio.create_task(_handle_ws_chat(client_id, data))
             elif action == "subscribe_task":
+                # 订阅异步任务的进度推送
                 await manager.subscribe_task(client_id, data["task_id"])
             elif action == "unsubscribe_task":
                 await manager.unsubscribe_task(client_id, data["task_id"])
             elif action == "pong":
-                pass
+                pass  # 心跳回复，无需处理
             else:
                 await manager.send_to_client(client_id, {
                     "type": "error",
@@ -154,7 +198,14 @@ async def _heartbeat_loop(client_id: str, interval: int = 30):
 
 
 async def _handle_ws_chat(client_id: str, data: dict):
-    """WebSocket 聊天处理，流式推送 chunk。"""
+    """WebSocket 聊天处理，流式推送 chunk。
+
+    实现模式：生产者-消费者
+    - 生产者：在线程池中运行同步生成器 chat_stream()
+    - 消费者：在 async 上下文中等待 Queue 消息并推送给客户端
+    - 使用 asyncio.Queue 桥接同步和异步世界
+    - None 作为结束信号，Exception 作为错误信号
+    """
     request_id = data.get("request_id", "")
     try:
         config = _apply_settings(
@@ -172,10 +223,11 @@ async def _handle_ws_chat(client_id: str, data: dict):
         messages = [{"role": "system", "content": system_msg}] + data["messages"]
 
         # chat_stream 是同步生成器，用线程池 + Queue 避免阻塞事件循环
-        queue = asyncio.Queue()
+        queue: asyncio.Queue = asyncio.Queue()
         loop = asyncio.get_event_loop()
 
         def _produce():
+            """线程池中运行：逐个 chunk 放入 Queue，None 表示结束。"""
             try:
                 for chunk in llm.chat_stream(messages):
                     asyncio.run_coroutine_threadsafe(queue.put(chunk), loop)
@@ -186,11 +238,12 @@ async def _handle_ws_chat(client_id: str, data: dict):
 
         _executor.submit(_produce)
 
+        # 消费者循环：从 Queue 取出 chunk 推送给客户端
         while True:
             item = await queue.get()
-            if item is None:
+            if item is None:  # 生产者已完成
                 break
-            if isinstance(item, Exception):
+            if isinstance(item, Exception):  # 生产者出错
                 await manager.send_to_client(client_id, {
                     "type": "chat_error",
                     "request_id": request_id,
@@ -269,7 +322,14 @@ def convert_async(
     base_url: str = Form(""),
     api_key: str = Form(""),
 ):
-    """异步转换：提交任务到 rq 队列，立即返回 task_id。"""
+    """异步转换：提交任务到 rq 队列，立即返回 task_id。
+
+    流程：
+    1. 校验文件并保存到临时目录
+    2. 在 Redis 中初始化任务状态（Hash）
+    3. 将任务提交到 rq 队列，worker 会异步执行
+    4. 前端通过 WebSocket subscribe_task 或 HTTP 轮询获取进度
+    """
     r = _get_redis()
     if r is None:
         raise HTTPException(status_code=503, detail="Redis 不可用，请使用 /api/v1/convert 同步模式")
@@ -290,6 +350,7 @@ def convert_async(
 
     task_id = str(uuid.uuid4())
 
+    # 初始化任务状态，1 小时后自动过期
     r.hset(f"task:{task_id}", mapping={
         "status": "queued",
         "step": "queued",
@@ -298,6 +359,7 @@ def convert_async(
     })
     r.expire(f"task:{task_id}", 3600)
 
+    # 提交到 rq 队列，worker.run_conversion 会在独立进程中执行
     q = Queue(connection=r)
     q.enqueue(
         "worker.run_conversion",

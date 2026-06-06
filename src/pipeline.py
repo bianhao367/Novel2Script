@@ -1,4 +1,21 @@
-"""流程编排 —— 串联"读取→构造prompt→调用LLM→解析校验→输出"的完整流程。"""
+"""
+流程编排
+========
+串联"读取 → 构造 prompt → 调用 LLM → 解析校验 → 输出"的完整流程。
+
+Pipeline 是核心业务逻辑的入口，负责协调各模块完成小说到剧本的转换：
+1. NovelReader 读取并分块小说文本
+2. prompt 构造器组装 LLM 对话消息
+3. LLMClient 调用大模型生成 YAML 剧本
+4. parser 解析并用 Pydantic 校验输出
+5. 结果写入 YAML 文件并生成 Schema 文档
+
+使用方式：
+    pipeline = Pipeline(config, progress_callback=my_callback)
+    script = pipeline.run("novel.txt")
+
+进度回调（progress_callback）在关键步骤触发，可用于前端进度条展示。
+"""
 
 from pathlib import Path
 from typing import Callable, Optional
@@ -12,7 +29,14 @@ from src.schema_gen import generate_json_schema, generate_markdown_doc
 
 
 class Pipeline:
-    """编排小说到剧本的完整转换流程。"""
+    """编排小说到剧本的完整转换流程。
+
+    属性:
+        config: 全局配置对象
+        llm: LLM 客户端实例
+        output_dir: 输出根目录
+        _progress: 进度回调函数 (step_name, percent)
+    """
 
     def __init__(self, config: Config, progress_callback: Optional[Callable[[str, int], None]] = None):
         self.config = config

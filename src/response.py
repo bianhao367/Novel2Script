@@ -1,4 +1,16 @@
-"""共享的响应构建函数 —— server.py 和 worker.py 共用。"""
+"""
+共享的响应构建函数
+==================
+server.py（同步转换）和 worker.py（异步转换）共用的响应格式化逻辑。
+
+将内部 Script 对象转换为 API 响应字典，包含：
+- novel_name: 小说名称
+- title: 剧本标题
+- scene_count / character_count: 统计摘要
+- scenes: 各场景的对白数和动作数
+- characters: 角色列表
+- script: 完整剧本数据（model_dump）
+"""
 
 from src.parser import Script
 

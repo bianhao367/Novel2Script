@@ -1,4 +1,19 @@
-"""LLM 客户端 —— 封装 OpenAI（兼容）API 的调用，含错误处理和重试机制。"""
+"""
+LLM 客户端
+==========
+封装 OpenAI（兼容）API 的调用，支持同步和流式两种模式。
+
+特性：
+- 自动重试：速率限制、超时、连接失败时指数退避重试（最多 3 次）
+- 双通道流式：chat_stream() 同时输出 reasoning（思考过程）和 content（正文）
+- 兼容 DeepSeek R1 等支持 reasoning_content 的模型
+
+使用方式：
+    client = LLMClient(config)
+    reply = client.chat(messages)              # 同步调用
+    for chunk in client.chat_stream(messages): # 流式调用
+        print(chunk["type"], chunk["content"])
+"""
 
 import time
 
@@ -19,15 +34,15 @@ class LLMError(Exception):
 
 
 class LLMClient:
-    """OpenAI Python SDK 的封装，带自动重试。"""
+    """OpenAI Python SDK 的封装，带自动重试和流式支持。"""
 
     def __init__(self, config: Config):
         self.config = config
         self._client = OpenAI(
             base_url=config.api.base_url,
             api_key=config.api.api_key,
-            timeout=120.0,          # 总超时 120 秒
-            max_retries=0,          # 由我们自己的重试逻辑控制
+            timeout=120.0,   # 单次请求超时 120 秒
+            max_retries=0,   # 禁用 SDK 自带重试，由我们自己控制
         )
 
     def chat(self, messages: list[dict]) -> str:

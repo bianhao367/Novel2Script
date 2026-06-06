@@ -1,4 +1,15 @@
-"""Schema 文档生成器 —— 根据 Pydantic 模型生成 JSON Schema 和 Markdown 参考文档。"""
+"""
+Schema 文档生成器
+=================
+根据 Pydantic 模型生成 JSON Schema 和 Markdown 参考文档。
+
+生成的文档帮助理解剧本数据结构，可供前端表单校验或第三方集成参考。
+Pipeline 在每次转换完成后自动调用，将文档写入 output/schema/ 目录。
+
+使用方式：
+    generate_json_schema("output/schema/script_schema.json")
+    generate_markdown_doc("output/schema/script_schema.md")
+"""
 
 import json
 from pathlib import Path

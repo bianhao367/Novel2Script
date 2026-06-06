@@ -1,4 +1,17 @@
-"""小说读取器 —— 读取 .txt 小说文件并按段落分块，供 LLM 逐块处理。"""
+"""
+小说读取器
+==========
+读取 .txt 小说文件并按段落分块，供 LLM 逐块处理。
+
+特性：
+- 自动编码探测：依次尝试 UTF-8、GBK、GB18030，最终 fallback 替换
+- 惰性读取：首次访问 full_text 时才读取文件
+- 段落感知分块：在双换行（段落边界）处切分，保持段落完整
+
+使用方式：
+    reader = NovelReader("novel.txt")
+    chunks = reader.chunks(3000)  # 每块约 3000 字符
+"""
 
 from pathlib import Path
 

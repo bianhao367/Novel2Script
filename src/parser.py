@@ -1,4 +1,20 @@
-"""YAML 解析与校验 —— 解析 LLM 返回的 YAML 并用 Pydantic 模型校验剧本结构。"""
+"""
+YAML 解析与校验
+===============
+解析 LLM 返回的 YAML 文本，并用 Pydantic v2 模型校验剧本结构。
+
+剧本结构（Script）包含：
+- scenes: 场景列表，每场包含 content（对白/动作交替）
+- characters: 角色信息列表
+- title: 剧本标题
+
+使用 Pydantic v2 的 Discriminated Union 特性，content 列表中的每个元素
+根据 type 字段（"dialogue" / "action"）自动路由到对应模型。
+
+使用方式：
+    script = parse_yaml(llm_output)    # 解析并校验
+    yaml_str = script_to_yaml(script)   # 序列化回 YAML
+"""
 
 import yaml
 

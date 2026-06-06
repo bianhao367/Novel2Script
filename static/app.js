@@ -1,8 +1,23 @@
 /**
  * Novel2Script — 前端交互逻辑
- *   - 常规 AI 对话（文字输入 → /api/v1/chat，SSE 流式）
- *   - 小说转剧本（文件上传 → /api/v1/convert）
- *   - 对话历史 + 剧本上下文在两种模式间共享
+ * =============================
+ * 负责所有用户交互、API 通信和 DOM 渲染。
+ *
+ * 通信架构：
+ *   - WebSocket（主通道）：聊天流式输出、任务进度推送、心跳检测
+ *   - SSE（降级方案）：WS 不可用时的聊天流式输出
+ *   - HTTP 轮询（降级方案）：WS 不可用时的任务进度查询
+ *   - HTTP POST：文件上传（WS 不支持 multipart）
+ *
+ * 状态管理：
+ *   - conversationHistory: 对话消息数组，发送给 LLM
+ *   - scriptContext: 当前剧本上下文 JSON，注入到 LLM 系统提示
+ *   - pendingChatRequests: WS 流式聊天的进行中请求
+ *   - taskResolvers: 异步转换任务的 Promise 解析器
+ *
+ * 降级策略：
+ *   WS 可用 → 全走 WS → WS 断开重连（指数退避，最多 5 次）
+ *   → 重连失败 → 聊天降级 SSE，进度降级 HTTP 轮询
  */
 
 // ====== DOM 引用 ======
@@ -52,16 +67,18 @@ let apiSettings = {
 };
 
 // ====== WebSocket 管理 ======
-let ws = null;
-let wsReady = false;
-let wsReconnectAttempts = 0;
-const WS_MAX_RECONNECT = 5;
-const WS_RECONNECT_BASE_DELAY = 1000;
+// WebSocket 用于替代 SSE + HTTP 轮询，实现双向实时通信
+let ws = null;                    // WebSocket 实例
+let wsReady = false;              // 连接是否就绪
+let wsReconnectAttempts = 0;      // 当前重连尝试次数
+const WS_MAX_RECONNECT = 5;       // 最大重连次数
+const WS_RECONNECT_BASE_DELAY = 1000;  // 基础重连延迟（ms），指数退避
 
 const pendingChatRequests = new Map();  // request_id -> {streamingId, fullContent, fullReasoning}
-const activeTasks = new Set();
-const taskResolvers = new Map();        // task_id -> {resolve, reject}
+const activeTasks = new Set();          // 当前订阅的异步任务 ID
+const taskResolvers = new Map();        // task_id -> {resolve, reject}，将 WS 推送转为 Promise
 
+/** 建立 WebSocket 连接，连接成功后自动重订阅进行中的任务。 */
 function connectWebSocket() {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${protocol}//${location.host}/ws`;
@@ -71,6 +88,7 @@ function connectWebSocket() {
     ws.onopen = () => {
         wsReady = true;
         wsReconnectAttempts = 0;
+        // 重连后重新订阅所有进行中的任务
         for (const taskId of activeTasks) {
             wsSend({ action: 'subscribe_task', task_id: taskId });
         }
@@ -106,6 +124,19 @@ function scheduleReconnect() {
     setTimeout(connectWebSocket, delay);
 }
 
+/**
+ * WebSocket 消息路由：根据 type 字段分发到对应处理逻辑。
+ * 消息协议（服务端→客户端）：
+ * - ping: 心跳，需回 pong
+ * - health: 连接建立后的健康信息（model, base_url）
+ * - chat_chunk: 流式聊天片段（reasoning 或 content）
+ * - chat_done: 流式聊天完成
+ * - chat_error: 流式聊天错误
+ * - task_progress: 异步任务进度更新
+ * - task_done: 异步任务完成
+ * - task_failed: 异步任务失败
+ * - error: 通用错误
+ */
 function handleWsMessage(msg) {
     switch (msg.type) {
         case 'ping':
@@ -570,7 +601,12 @@ async function handleSendSSE(aiMsgId) {
 }
 
 // ====== 异步转换（WS 推送 + 轮询降级） ======
+// 降级链：WS 推送 → HTTP 轮询 → 同步转换
 
+/**
+ * 异步转换文件：HTTP 提交任务 + WS 订阅进度。
+ * 503 表示 Redis 不可用，降级到同步转换。
+ */
 async function convertAsyncWs(formData) {
     const submitRes = await fetch('/api/v1/convert/async', { method: 'POST', body: formData });
 
@@ -584,12 +620,14 @@ async function convertAsyncWs(formData) {
     addAiProgressWithId('msg-progress-' + task_id, `正在转换: ${novel_name}`);
 
     if (wsReady) {
+        // WS 可用：订阅任务进度，返回 Promise 等待 task_done/task_failed
         activeTasks.add(task_id);
         wsSend({ action: 'subscribe_task', task_id: task_id });
         return new Promise((resolve, reject) => {
             taskResolvers.set(task_id, { resolve, reject });
         });
     } else {
+        // WS 不可用：降级到 HTTP 轮询
         return await convertAsyncPolling(task_id);
     }
 }
@@ -649,7 +687,10 @@ function autoResizeTextarea() {
 }
 
 // ====== 消息渲染 ======
+// 所有消息通过 insertAdjacentHTML 动态插入 chatArea
+// 每种消息类型对应一个 add* 函数，返回 DOM id 供后续更新/删除
 
+/** 格式化当前时间为 HH:MM */
 function formatTime() {
     const now = new Date();
     const h = String(now.getHours()).padStart(2, '0');
@@ -657,6 +698,7 @@ function formatTime() {
     return `${h}:${m}`;
 }
 
+/** 添加用户消息气泡（右侧蓝色） */
 function addUserMessage(text, isFile) {
     const id = 'msg-' + Date.now();
     const html = `
