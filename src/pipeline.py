@@ -33,7 +33,7 @@ from src.parser import (
     ChunkOutline, DialogueScript, ActionScript,
 )
 from src.prompt import (
-    build_memory_prompt, build_memory_update_prompt,
+    build_memory_update_prompt,
     build_review_prompt, build_director_prompt, build_fix_prompt,
     build_orchestrator_prompt, build_dialogue_agent_prompt, build_action_agent_prompt,
 )
@@ -42,10 +42,11 @@ from src.schema_gen import generate_json_schema, generate_markdown_doc
 
 
 _MEMORY_CHAR_THRESHOLD = 40  # 角色数超过此值时压缩次要角色
+_compressed_chars: set[str] = set()  # 已压缩过的角色名，避免重复截断
 
 
 def _compress_registry(registry: dict[str, dict]) -> None:
-    """压缩角色注册表：主要角色保留完整描述，次要角色截断。"""
+    """压缩角色注册表：主要角色保留完整描述，次要角色截断（只截断一次）。"""
     if len(registry) <= _MEMORY_CHAR_THRESHOLD:
         return
     main_count = 0
@@ -53,10 +54,12 @@ def _compress_registry(registry: dict[str, dict]) -> None:
     for name, info in registry.items():
         if info.get("is_main"):
             main_count += 1
-        elif len(info.get("description", "")) > 80:
-            info["description"] = info["description"][:77] + "..."
+        elif name not in _compressed_chars and len(info.get("description", "")) > 120:
+            info["description"] = info["description"][:117] + "..."
+            _compressed_chars.add(name)
             compressed += 1
-    print(f"  角色注册表压缩: {main_count} 主角保留完整, {compressed} 次要角色截断描述")
+    if compressed:
+        print(f"  角色注册表压缩: {main_count} 主角保留完整, {compressed} 次要角色截断描述")
 
 
 class Pipeline:
@@ -121,14 +124,15 @@ class Pipeline:
 
         chunk_executor = ThreadPoolExecutor(max_workers=3)
 
-        def _submit_orchestrator(chunk_text: str, registry: dict, scene_num: int):
-            """提交编排 Agent 到线程池（传 registry 副本避免竞态）。"""
+        def _submit_orchestrator(chunk_text: str, registry: dict, scene_num: int, summaries: list[str]):
+            """提交编排 Agent 到线程池（传 registry 深拷贝避免竞态）。"""
+            deep_copy = {k: dict(v) for k, v in registry.items()}
             return chunk_executor.submit(
-                self._call_orchestrator, chunk_text, dict(registry), scene_num,
+                self._call_orchestrator, chunk_text, deep_copy, scene_num, summaries,
             )
 
         # 预取第一块的编排结果
-        prefetch_future = _submit_orchestrator(chunks[0], character_registry, next_scene_number)
+        prefetch_future = _submit_orchestrator(chunks[0], character_registry, next_scene_number, event_summaries)
 
         for i, chunk in enumerate(chunks):
             if self._cancel_event and self._cancel_event.is_set():
@@ -147,7 +151,7 @@ class Pipeline:
             # 预取下一块的编排（与当前块的专家/审查并行）
             if i + 1 < total_chunks:
                 prefetch_future = _submit_orchestrator(
-                    chunks[i + 1], character_registry, next_scene_number,
+                    chunks[i + 1], character_registry, next_scene_number, event_summaries,
                 )
 
             if not outline.scenes:
@@ -179,11 +183,19 @@ class Pipeline:
             # ---- Step 2: 并行专家 (对白 + 动作) ----
             self._progress("calling_experts", base_pct + 3)
 
+            # 构建场景摘要供专家参考
+            scene_summary = "\n".join(
+                f"- 第{s.scene_number}场: {s.slugline}"
+                for s in outline.scenes
+            )
+
             def call_dialogue():
                 if not dialogue_paras:
                     return DialogueScript(items=[])
                 msgs = build_dialogue_agent_prompt(
                     chunk, character_registry, dialogue_paras, next_scene_number,
+                    event_summaries=event_summaries,
+                    scene_summary=scene_summary,
                 )
                 return parse_dialogue_script(self.llm.chat(msgs))
 
@@ -192,6 +204,8 @@ class Pipeline:
                     return ActionScript(items=[])
                 msgs = build_action_agent_prompt(
                     chunk, character_registry, action_paras, next_scene_number,
+                    event_summaries=event_summaries,
+                    scene_summary=scene_summary,
                 )
                 return parse_action_script(self.llm.chat(msgs))
 
@@ -214,8 +228,12 @@ class Pipeline:
                   f"动作 {len(action_script.items)} 条")
 
             # ---- Step 3: 合并专家输出 ----
+            characters = [
+                CharacterInfo(name=name, description=info["description"])
+                for name, info in character_registry.items()
+            ]
             script_fragment = merge_expert_outputs(
-                outline, dialogue_script, action_script, [],
+                outline, dialogue_script, action_script, characters,
             )
 
             # 序列化为 YAML 供审查和记忆使用
@@ -235,6 +253,7 @@ class Pipeline:
                     script_fragment_yaml=raw_output,
                     current_characters=character_registry,
                     start_scene_number=next_scene_number,
+                    original_novel_text=chunk,
                 )
                 review_raw = self.llm.chat(review_messages, max_tokens=2048)
 
@@ -257,6 +276,7 @@ class Pipeline:
                     review_issues=review_result.issues,
                     review_suggestions=review_result.suggestions,
                     original_novel_text=chunk,
+                    current_characters=character_registry,
                 )
                 fix_raw = self.llm.chat(fix_messages, max_tokens=4096)
 
@@ -274,12 +294,17 @@ class Pipeline:
             raw_path.write_text(raw_output, encoding="utf-8")
 
             # ---- Step 4.5: 记忆专家 (用审查后的最终 YAML) ----
-            try:
-                memory_msgs = build_memory_update_prompt(raw_output, character_registry)
-                memory_update = parse_memory_update(self.llm.chat(memory_msgs, max_tokens=2048))
-            except (ValueError, LLMError) as e:
-                print(f"  块 {chunk_idx} 记忆专家失败: {e}")
-                memory_update = None
+            memory_update = None
+            for mem_attempt in range(2):
+                try:
+                    memory_msgs = build_memory_update_prompt(raw_output, character_registry)
+                    memory_update = parse_memory_update(self.llm.chat(memory_msgs, max_tokens=2048))
+                    break
+                except (ValueError, LLMError) as e:
+                    if mem_attempt == 0:
+                        print(f"  块 {chunk_idx} 记忆专家失败，重试...")
+                    else:
+                        print(f"  块 {chunk_idx} 记忆专家重试也失败: {e}")
 
             # 更新场景编号
             if script_fragment.scenes:
@@ -359,20 +384,25 @@ class Pipeline:
         chunk: str,
         character_registry: dict[str, dict],
         start_scene_number: int,
+        event_summaries: list[str] | None = None,
     ) -> ChunkOutline:
-        """调用编排 Agent 分析场景结构和段落分类。"""
-        messages = build_orchestrator_prompt(
-            novel_text=chunk,
-            current_characters=character_registry,
-            start_scene_number=start_scene_number,
-        )
-
-        raw = self.llm.chat(messages, max_tokens=2048)
-        try:
-            return parse_chunk_outline(raw)
-        except ValueError as e:
-            print(f"  编排 Agent 解析失败: {e}")
-            return ChunkOutline(scenes=[])
+        """调用编排 Agent 分析场景结构和段落分类（失败最多重试 2 次）。"""
+        for attempt in range(2):
+            messages = build_orchestrator_prompt(
+                novel_text=chunk,
+                current_characters=character_registry,
+                start_scene_number=start_scene_number,
+                event_summaries=event_summaries,
+            )
+            raw = self.llm.chat(messages, max_tokens=2048)
+            try:
+                result = parse_chunk_outline(raw)
+                if result.scenes:
+                    return result
+            except ValueError:
+                pass
+            print(f"  编排 Agent 第 {attempt + 1} 次失败，重试...")
+        return ChunkOutline(scenes=[])
 
     def _run_director_phase(
         self,

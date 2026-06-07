@@ -12,102 +12,6 @@ SYSTEM_PROMPT 定义了 LLM 的角色（专业编剧）和输出格式（严格 
     response = llm.chat(messages)
 """
 
-SYSTEM_PROMPT = """\
-你是一名专业编剧。你的任务是将小说片段转换为结构化的 YAML 格式剧本。
-
-请只输出合法的 YAML —— 不要用 markdown 代码块包裹，不要添加任何额外的说明文字。\
-YAML 必须严格符合以下结构:
-
-```yaml
-title: "剧本标题"
-scenes:
-  - scene_number: 1
-    slugline: "内/外. 地点 - 时间（如：内. 古宅门厅 - 夜）"
-    content:
-      - type: "action"
-        text: "动作或舞台指示的描述文字"
-      - type: "dialogue"
-        character: "角色名"
-        parenthetical: "情绪或动作提示（可选，无则留空）"
-        line: "台词正文"
-characters:
-  - name: "角色名"
-    description: "角色简介"
-```
-
-核心规则:
-- content 列表中的项目按顺序排列，这个顺序就是剧本的演出顺序，必须忠实还原小说中动作与对话的交错节奏。
-- 每个 content 项只能是 action 或 dialogue 类型，二者交替出现以呈现"描述→对白→描述→对白"的自然叙事流。
-- 根据场景切换（地点变化）或时间跳跃将叙事拆分为不同的场次，每场以 slugline 标明地点和时间。
-- slugline 的格式: "内/外. 具体地点 - 时间"，如 "内. 侦探办公室 - 黄昏"。
-- 保留原著故事的主线、关键对话和情感基调。
-- 对于小说中模糊不清的地方，按照影视剧本惯例进行合理推断。
-- 所有有台词的角色必须出现在顶层 characters 列表中。
-"""
-
-
-def build_prompt(novel_text: str) -> list[dict]:
-    """构建 chat-completion 格式的消息列表。
-
-    返回可直接传给 OpenAI API 的 messages 列表。
-    """
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                "请将以下小说片段转换为剧本，按照上述 YAML 格式输出：\n\n" + novel_text
-            ),
-        },
-    ]
-
-
-# --- 多块记忆相关 Prompt ---
-
-MEMORY_SYSTEM_PROMPT = """\
-你是一名专业编剧。你的任务是将小说片段转换为结构化的 YAML 格式剧本。
-
-**重要上下文信息：**
-
-{character_registry}
-
-{event_memory}
-
-**当前片段是小说的第 {chunk_index} / {total_chunks} 部分。**
-请从上文自然衔接处开始转换，避免与已转换内容重复。
-如果当前片段与前文有重叠（上下文衔接区域），请跳过已转换的部分，只处理新内容。
-
-请只输出合法的 YAML —— 不要用 markdown 代码块包裹，不要添加任何额外的说明文字。\
-YAML 必须严格符合以下结构:
-
-```yaml
-title: "剧本标题"
-scenes:
-  - scene_number: {start_scene_number}
-    slugline: "内/外. 地点 - 时间（如：内. 古宅门厅 - 夜）"
-    content:
-      - type: "action"
-        text: "动作或舞台指示的描述文字"
-      - type: "dialogue"
-        character: "角色名"
-        parenthetical: "情绪或动作提示（可选，无则留空）"
-        line: "台词正文"
-characters:
-  - name: "角色名"
-    description: "角色简介"
-```
-
-核心规则:
-- scene_number 从 {start_scene_number} 开始编号，不得与之前的场景编号冲突。
-- content 列表中的项目按顺序排列，必须忠实还原小说中动作与对话的交错节奏。
-- 每个 content 项只能是 action 或 dialogue 类型。
-- 根据场景切换（地点变化）或时间跳跃将叙事拆分为不同的场次。
-- slugline 格式: "内/外. 具体地点 - 时间"。
-- 保留原著故事的主线、关键对话和情感基调。
-- 所有有台词的角色必须出现在 characters 列表中。
-- 已在角色注册表中的角色无需重新描述，仅需列出 name；如有新的角色信息变化可更新 description。
-"""
-
 MEMORY_UPDATE_PROMPT = """\
 你是一名编剧助手。请根据以下剧本片段，提取角色信息和剧情摘要。
 
@@ -140,44 +44,6 @@ def _format_character_registry(character_registry: dict[str, dict]) -> str:
         main_tag = "（主角）" if info.get("is_main") else ""
         char_lines.append(f"- {name}{main_tag}: {info.get('description', '')}")
     return "**角色注册表：**\n" + "\n".join(char_lines)
-
-
-def build_memory_prompt(
-    novel_text: str,
-    character_registry: dict[str, dict],
-    event_memory: str,
-    chunk_index: int,
-    total_chunks: int,
-    start_scene_number: int,
-) -> list[dict]:
-    """构建带记忆上下文的剧本生成 prompt。
-
-    Args:
-        novel_text: 当前块的小说文本
-        character_registry: {name: {description, is_main}} 角色注册表
-        event_memory: 压缩后的事件记忆摘要文本
-        chunk_index: 当前块序号（从1开始）
-        total_chunks: 总块数
-        start_scene_number: 本块场景的起始编号
-    """
-    char_text = _format_character_registry(character_registry)
-    event_text = f"**已发生的情节：**\n{event_memory}" if event_memory else "**已发生的情节：**（本片段为小说开头）"
-
-    system_content = MEMORY_SYSTEM_PROMPT.format(
-        character_registry=char_text,
-        event_memory=event_text,
-        chunk_index=chunk_index,
-        total_chunks=total_chunks,
-        start_scene_number=start_scene_number,
-    )
-
-    return [
-        {"role": "system", "content": system_content},
-        {
-            "role": "user",
-            "content": "请将以下小说片段转换为剧本，按照上述 YAML 格式输出：\n\n" + novel_text,
-        },
-    ]
 
 
 def build_memory_update_prompt(
@@ -277,6 +143,8 @@ ORCHESTRATOR_PROMPT = """\
 **角色注册表（已知角色）：**
 {current_characters}
 
+{event_memory}
+
 请输出合法的 YAML，格式如下：
 
 ```yaml
@@ -299,6 +167,7 @@ scenes:
 - para_idx 从 0 开始，按原文段落顺序递增
 - scene_number 从 {start_scene_number} 开始
 - 不要生成任何剧本内容，只做结构分析
+- 如果当前片段的开头与前文有重叠（上下文衔接区域），请识别并跳过重叠部分，只对新内容进行场景编排。重叠段落不应出现在任何场景中。
 """
 
 
@@ -306,13 +175,20 @@ def build_orchestrator_prompt(
     novel_text: str,
     current_characters: dict[str, dict],
     start_scene_number: int,
+    event_summaries: list[str] | None = None,
 ) -> list[dict]:
     """构建编排 Agent 的 prompt。"""
     char_text = _format_character_registry(current_characters)
+    event_text = (
+        "**已发生的情节：**\n" + "\n".join(event_summaries)
+        if event_summaries
+        else "**已发生的情节：**（本片段为小说开头）"
+    )
 
     system_content = ORCHESTRATOR_PROMPT.format(
         current_characters=char_text,
         start_scene_number=start_scene_number,
+        event_memory=event_text,
     )
 
     # 为段落编号，方便 LLM 引用 para_idx
@@ -340,6 +216,13 @@ DIALOGUE_AGENT_PROMPT = """\
 **角色注册表：**
 {current_characters}
 
+{event_memory}
+
+**场景结构：**
+{scene_summary}
+
+请确保每个 item 的 scene_number 与上述场景结构一致。
+
 请输出合法的 YAML，格式如下：
 
 ```yaml
@@ -359,6 +242,7 @@ items:
 - parenthetical 是情绪/动作提示（可选），如"愤怒地"、"低声"、"转身"
 - 如果一个段落包含多句对白，拆分为多个 items（相同 para_idx）
 - 不要输出任何 action/舞台指示内容
+- 如果当前片段的开头与前文有重叠（上下文衔接区域），请跳过重叠部分，只处理新内容
 """
 
 
@@ -367,6 +251,8 @@ def build_dialogue_agent_prompt(
     current_characters: dict[str, dict],
     dialogue_paragraphs: list[tuple[int, str]],
     start_scene_number: int,
+    event_summaries: list[str] | None = None,
+    scene_summary: str = "",
 ) -> list[dict]:
     """构建对白专家的 prompt。
 
@@ -375,12 +261,24 @@ def build_dialogue_agent_prompt(
         current_characters: 角色注册表
         dialogue_paragraphs: [(para_idx, text), ...] 对白段落列表
         start_scene_number: 起始场景号
+        event_summaries: 已发生的事件摘要列表
+        scene_summary: 场景结构摘要文本
     """
     char_text = _format_character_registry(current_characters)
     # 将对白段落带编号拼接
     para_text = "\n\n".join(f"[段落{idx}] {text}" for idx, text in dialogue_paragraphs)
 
-    system_content = DIALOGUE_AGENT_PROMPT.format(current_characters=char_text)
+    event_text = (
+        "**已发生的情节：**\n" + "\n".join(event_summaries)
+        if event_summaries
+        else "**已发生的情节：**（本片段为小说开头）"
+    )
+
+    system_content = DIALOGUE_AGENT_PROMPT.format(
+        current_characters=char_text,
+        event_memory=event_text,
+        scene_summary=scene_summary,
+    )
 
     return [
         {"role": "system", "content": system_content},
@@ -399,6 +297,13 @@ ACTION_AGENT_PROMPT = """\
 **角色注册表：**
 {current_characters}
 
+{event_memory}
+
+**场景结构：**
+{scene_summary}
+
+请确保每个 item 的 scene_number 与上述场景结构一致。
+
 请输出合法的 YAML，格式如下：
 
 ```yaml
@@ -415,6 +320,7 @@ items:
 - 忠实还原原著的场景氛围和人物动作
 - 不要输出任何对白/台词内容
 - 如果一个段落包含多个动作描述，可以拆分为多个 items（相同 para_idx）
+- 如果当前片段的开头与前文有重叠（上下文衔接区域），请跳过重叠部分，只处理新内容
 """
 
 
@@ -423,6 +329,8 @@ def build_action_agent_prompt(
     current_characters: dict[str, dict],
     action_paragraphs: list[tuple[int, str]],
     start_scene_number: int,
+    event_summaries: list[str] | None = None,
+    scene_summary: str = "",
 ) -> list[dict]:
     """构建动作专家的 prompt。
 
@@ -431,12 +339,24 @@ def build_action_agent_prompt(
         current_characters: 角色注册表
         action_paragraphs: [(para_idx, text), ...] 动作段落列表
         start_scene_number: 起始场景号
+        event_summaries: 已发生的事件摘要列表
+        scene_summary: 场景结构摘要文本
     """
     char_text = _format_character_registry(current_characters)
     # 将动作段落带编号拼接
     para_text = "\n\n".join(f"[段落{idx}] {text}" for idx, text in action_paragraphs)
 
-    system_content = ACTION_AGENT_PROMPT.format(current_characters=char_text)
+    event_text = (
+        "**已发生的情节：**\n" + "\n".join(event_summaries)
+        if event_summaries
+        else "**已发生的情节：**（本片段为小说开头）"
+    )
+
+    system_content = ACTION_AGENT_PROMPT.format(
+        current_characters=char_text,
+        event_memory=event_text,
+        scene_summary=scene_summary,
+    )
 
     return [
         {"role": "system", "content": system_content},
@@ -484,6 +404,7 @@ def build_review_prompt(
     script_fragment_yaml: str,
     current_characters: dict[str, dict],
     start_scene_number: int,
+    original_novel_text: str = "",
 ) -> list[dict]:
     """构建审查 Agent 的 prompt。
 
@@ -491,6 +412,7 @@ def build_review_prompt(
         script_fragment_yaml: 当前块生成的剧本 YAML 文本
         current_characters: 当前角色注册表
         start_scene_number: 本块场景的起始编号
+        original_novel_text: 原始小说文本（供忠实度审查）
     """
     char_text = _format_character_registry(current_characters)
 
@@ -499,12 +421,13 @@ def build_review_prompt(
         start_scene_number=start_scene_number,
     )
 
+    user_content = f"以下是待审查的剧本片段 YAML：\n\n{script_fragment_yaml}"
+    if original_novel_text:
+        user_content += f"\n\n以下是原始小说片段（请检查剧本是否忠实还原了原著的对白和情节）：\n\n{original_novel_text}"
+
     return [
         {"role": "system", "content": system_content},
-        {
-            "role": "user",
-            "content": f"以下是待审查的剧本片段 YAML：\n\n{script_fragment_yaml}",
-        },
+        {"role": "user", "content": user_content},
     ]
 
 
@@ -513,6 +436,7 @@ def build_fix_prompt(
     review_issues: list[str],
     review_suggestions: str,
     original_novel_text: str,
+    current_characters: dict[str, dict] | None = None,
 ) -> list[dict]:
     """构建修正 prompt，将审查问题注入上下文供编剧针对性修改。
 
@@ -521,14 +445,18 @@ def build_fix_prompt(
         review_issues: 审查发现的问题列表
         review_suggestions: 审查给出的修正建议
         original_novel_text: 原始小说片段（供编剧参考还原）
+        current_characters: 当前角色注册表（供角色名一致性参考）
     """
     issues_text = "\n".join(f"- {issue}" for issue in review_issues)
+    char_text = _format_character_registry(current_characters) if current_characters else ""
+
+    system_content = "你是一名专业编剧。审查员发现了以下问题，请针对性修正剧本。\n"
+    if char_text:
+        system_content += f"\n{char_text}\n"
+    system_content += "只输出修正后的完整 YAML，不要添加额外文字。"
 
     return [
-        {"role": "system", "content": (
-            "你是一名专业编剧。审查员发现了以下问题，请针对性修正剧本。\n"
-            "只输出修正后的完整 YAML，不要添加额外文字。"
-        )},
+        {"role": "system", "content": system_content},
         {"role": "user", "content": (
             f"审查发现的问题：\n{issues_text}\n\n"
             f"修正建议：{review_suggestions}\n\n"
