@@ -1041,6 +1041,13 @@ body {
     color: var(--text-placeholder);
 }
 
+.field-hint {
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
 .modal-footer {
     display: flex;
     justify-content: flex-end;
