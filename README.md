@@ -18,6 +18,7 @@ pip install -r requirements.txt
 # MODEL = "gpt-4o"   ← 改成你实际使用的模型名
 
 # 4. 启动 Web 服务
+redis-server
 python server.py
 ```
 
