@@ -67,14 +67,14 @@ manager = ConnectionManager()
 _executor = ThreadPoolExecutor(max_workers=4)
 atexit.register(_executor.shutdown, wait=False)
 _memory_tasks: dict[str, dict] = {}  # Redis 不可用时内存中跟踪任务状态
+_memory_tasks_lock = threading.Lock()
 
 _MEMORY_TASKS_MAX = 100
 
 def _memory_tasks_cleanup():
-    """删除已完成/失败的旧任务，保留最近 100 个。"""
+    """保留最近 100 个条目，删除最旧的。调用前需持有 _memory_tasks_lock。"""
     if len(_memory_tasks) <= _MEMORY_TASKS_MAX:
         return
-    # 按创建时间排序，删除最旧的多余条目
     sorted_items = sorted(
         _memory_tasks.items(),
         key=lambda kv: kv[1].get("_created_at", 0),
@@ -210,6 +210,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     # 启动心跳循环，每 30 秒发一次 ping，客户端需回 pong
     heartbeat_task = asyncio.create_task(_heartbeat_loop(client_id))
+    chat_tasks: list[asyncio.Task] = []
 
     try:
         while True:
@@ -217,7 +218,9 @@ async def websocket_endpoint(websocket: WebSocket):
             action = data.get("action")
             if action == "chat":
                 # 异步处理聊天，不阻塞消息接收循环
-                asyncio.create_task(_handle_ws_chat(client_id, data))
+                task = asyncio.create_task(_handle_ws_chat(client_id, data))
+                chat_tasks.append(task)
+                task.add_done_callback(lambda t: chat_tasks.remove(t) if t in chat_tasks else None)
             elif action == "subscribe_task":
                 # 订阅异步任务的进度推送
                 await manager.subscribe_task(client_id, data["task_id"])
@@ -234,6 +237,8 @@ async def websocket_endpoint(websocket: WebSocket):
         pass
     finally:
         heartbeat_task.cancel()
+        for t in chat_tasks:
+            t.cancel()
         await manager.disconnect(client_id)
 
 
@@ -273,7 +278,7 @@ async def _handle_ws_chat(client_id: str, data: dict):
 
         # chat_stream 是同步生成器，用线程池 + Queue 避免阻塞事件循环
         queue: asyncio.Queue = asyncio.Queue()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _produce():
             """线程池中运行：逐个 chunk 放入 Queue，None 表示结束。"""
@@ -500,11 +505,12 @@ def convert_async(
             }))
         else:
             # 无 Redis：存内存供轮询
-            _memory_tasks_cleanup()
-            _memory_tasks[task_id] = {
-                "status": "processing", "step": step, "percent": percent,
-                "_created_at": time.time(),
-            }
+            with _memory_tasks_lock:
+                _memory_tasks_cleanup()
+                _memory_tasks[task_id] = {
+                    "status": "processing", "step": step, "percent": percent,
+                    "_created_at": time.time(),
+                }
 
     def run_pipeline():
         try:
@@ -523,12 +529,13 @@ def convert_async(
                     "percent": 100, "result": result,
                 }, ensure_ascii=False))
             else:
-                _memory_tasks_cleanup()
-                _memory_tasks[task_id] = {
-                    "status": "done", "step": "done", "percent": 100,
-                    "result": result, "novel_name": novel_name,
-                    "_created_at": time.time(),
-                }
+                with _memory_tasks_lock:
+                    _memory_tasks_cleanup()
+                    _memory_tasks[task_id] = {
+                        "status": "done", "step": "done", "percent": 100,
+                        "result": result, "novel_name": novel_name,
+                        "_created_at": time.time(),
+                    }
         except Exception as e:
             error_msg = f"{type(e).__name__}: {e}"
             traceback.print_exc()
@@ -542,10 +549,11 @@ def convert_async(
                     "step": "error", "percent": 0, "error": error_msg,
                 }))
             else:
-                _memory_tasks_cleanup()
-                _memory_tasks[task_id] = {
-                    "status": "failed", "step": "error", "percent": 0,
-                    "error": error_msg,
+                with _memory_tasks_lock:
+                    _memory_tasks_cleanup()
+                    _memory_tasks[task_id] = {
+                        "status": "failed", "step": "error", "percent": 0,
+                        "error": error_msg,
                     "_created_at": time.time(),
                 }
         finally:
@@ -583,7 +591,8 @@ def get_task_status(task_id: str):
             return resp
 
     # 内存后备
-    data = _memory_tasks.get(task_id)
+    with _memory_tasks_lock:
+        data = _memory_tasks.get(task_id)
     if not data:
         raise HTTPException(status_code=404, detail="任务不存在")
 

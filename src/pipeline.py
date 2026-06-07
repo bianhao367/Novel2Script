@@ -42,10 +42,9 @@ from src.schema_gen import generate_json_schema, generate_markdown_doc
 
 
 _MEMORY_CHAR_THRESHOLD = 40  # 角色数超过此值时压缩次要角色
-_compressed_chars: set[str] = set()  # 已压缩过的角色名，避免重复截断
 
 
-def _compress_registry(registry: dict[str, dict]) -> None:
+def _compress_registry(registry: dict[str, dict], compressed_chars: set[str]) -> None:
     """压缩角色注册表：主要角色保留完整描述，次要角色截断（只截断一次）。"""
     if len(registry) <= _MEMORY_CHAR_THRESHOLD:
         return
@@ -54,9 +53,9 @@ def _compress_registry(registry: dict[str, dict]) -> None:
     for name, info in registry.items():
         if info.get("is_main"):
             main_count += 1
-        elif name not in _compressed_chars and len(info.get("description", "")) > 120:
+        elif name not in compressed_chars and len(info.get("description", "")) > 120:
             info["description"] = info["description"][:117] + "..."
-            _compressed_chars.add(name)
+            compressed_chars.add(name)
             compressed += 1
     if compressed:
         print(f"  角色注册表压缩: {main_count} 主角保留完整, {compressed} 次要角色截断描述")
@@ -85,6 +84,7 @@ class Pipeline:
         self._progress = progress_callback or (lambda step, pct: None)
         self._chunk_result = chunk_result_callback or (lambda data: None)
         self._cancel_event = cancel_event
+        self._compressed_chars: set[str] = set()
 
     def run(self, novel_path: str | Path, novel_name: str | None = None) -> Script:
         """对一部小说执行完整流程：导演预读 → 滑动窗口分块 → 逐块生成 → 多轮审查 → 合并输出。"""
@@ -350,10 +350,17 @@ class Pipeline:
                 if memory_update.event_summary:
                     event_summaries.append(memory_update.event_summary)
 
+                # 压缩事件记忆，防止 prompt 无限增长
+                max_chars = self.config.pipeline.event_memory_max_chars
+                compressed = compress_event_memory(event_summaries, max_chars)
+                event_summaries.clear()
+                if compressed:
+                    event_summaries.append(compressed)
+
                 print(f"  记忆更新: {len(memory_update.characters)} 角色, "
                       f"事件: {memory_update.event_summary[:60]}...")
 
-            _compress_registry(character_registry)
+            _compress_registry(character_registry, self._compressed_chars)
 
         chunk_executor.shutdown(wait=True)
 

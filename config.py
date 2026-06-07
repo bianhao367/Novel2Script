@@ -8,7 +8,6 @@ MAX_TOKENS = 4096
 # --- 流程参数 ---
 CHUNK_SIZE = 3000              # 每次发给 LLM 的最大字符数
 OUTPUT_DIR = "./output"        # 输出根目录
-OUTPUT_FORMAT = "yaml"         # 输出格式
 OVERLAP_SIZE = 500             # 滑动窗口重叠字符数
 EVENT_MEMORY_MAX_CHARS = 1500  # 事件记忆最大字符数，超过则自动压缩
 
