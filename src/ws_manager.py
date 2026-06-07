@@ -132,7 +132,7 @@ class ConnectionManager:
         pubsub = r.pubsub()
         pubsub.subscribe(f"task_events:{task_id}")
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             while True:
                 # 在线程中阻塞读取，避免阻塞事件循环

@@ -47,10 +47,9 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from src.config import Config, ApiConfig, PipelineConfig, load_config
 from src.llm_client import LLMError, LLMClient
-from src.parser import SCRIPT_SCHEMA
+from src.parser import SCRIPT_SCHEMA, Script
 from src.pipeline import Pipeline
-from src.response import script_to_response
-from ws_manager import ConnectionManager
+from src.ws_manager import ConnectionManager
 
 app = FastAPI(
     title="Novel2Script",
@@ -117,8 +116,30 @@ def _apply_settings(base: Config, model: str, base_url: str, api_key: str) -> Co
 
 # --- 响应模型 ---
 
-def _script_to_response(script, novel_name: str) -> dict:
-    return script_to_response(script, novel_name)
+def _script_to_response(script: Script, novel_name: str) -> dict:
+    """将 Script 对象转换为 API 响应字典。"""
+    scenes_summary = []
+    for s in script.scenes:
+        dialogue_count = sum(1 for c in s.content if c.type == "dialogue")
+        action_count = sum(1 for c in s.content if c.type == "action")
+        scenes_summary.append({
+            "scene_number": s.scene_number,
+            "slugline": s.slugline,
+            "dialogue_count": dialogue_count,
+            "action_count": action_count,
+        })
+    return {
+        "novel_name": novel_name,
+        "title": script.title,
+        "scene_count": len(script.scenes),
+        "character_count": len(script.characters),
+        "scenes": scenes_summary,
+        "characters": [
+            {"name": c.name, "description": c.description}
+            for c in script.characters
+        ],
+        "script": script.model_dump(),
+    }
 
 
 # --- Redis 连接池（单例，启动时初始化一次） ---
@@ -554,8 +575,8 @@ def convert_async(
                     _memory_tasks[task_id] = {
                         "status": "failed", "step": "error", "percent": 0,
                         "error": error_msg,
-                    "_created_at": time.time(),
-                }
+                        "_created_at": time.time(),
+                    }
         finally:
             Path(tmp_path).unlink(missing_ok=True)
             if r:

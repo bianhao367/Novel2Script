@@ -11,5 +11,11 @@ __pycache__/
 # 生成输出
 output/
 
+# 测试数据
+data/
+
+# Redis
+dump.rdb
+
 # IDE 配置
 .idea/
