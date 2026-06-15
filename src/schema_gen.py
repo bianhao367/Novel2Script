@@ -17,8 +17,15 @@ from pathlib import Path
 from src.parser import SCRIPT_SCHEMA
 
 
-def generate_json_schema(output_path: str | Path) -> dict:
-    """从 Pydantic Script 模型生成 JSON Schema 并写入文件。"""
+def generate_json_schema(output_path: str | Path) -> dict:  # output_path: JSON Schema 输出文件路径
+    """从 Pydantic Script 模型生成 JSON Schema 并写入文件。
+
+    流程：
+    1. SCRIPT_SCHEMA.model_json_schema() 生成 JSON Schema dict
+    2. Path(output_path).parent.mkdir(parents=True) 创建输出目录
+    3. json.dumps() 序列化为带缩进的 JSON 字符串
+    4. write_text() 写入文件
+    """
     schema = SCRIPT_SCHEMA.model_json_schema()
 
     output_path = Path(output_path)
@@ -30,8 +37,16 @@ def generate_json_schema(output_path: str | Path) -> dict:
     return schema
 
 
-def generate_markdown_doc(output_path: str | Path) -> str:
-    """生成可读的 Markdown 格式 Schema 参考文档。"""
+def generate_markdown_doc(output_path: str | Path) -> str:  # output_path: Markdown 文档输出文件路径
+    """生成可读的 Markdown 格式 Schema 参考文档。
+
+    流程：
+    1. 获取 JSON Schema dict
+    2. 遍历顶层 properties，用 _describe_type() 转为中文类型描述
+    3. 对每个字段，用 _resolve_ref() 检查是否有子模型引用
+    4. 有引用 → 调用 _render_nested() 递归渲染嵌套字段为 Markdown 列表
+    5. 拼接所有行，写入文件
+    """
 
     schema = SCRIPT_SCHEMA.model_json_schema()
 
@@ -95,7 +110,7 @@ def _resolve_ref(field_info: dict, root_schema: dict) -> dict | None:
     return None
 
 
-def _render_nested(defn: dict, root_schema: dict, indent: str = "") -> str:
+def _render_nested(defn: dict, root_schema: dict, indent: str = "") -> str:  # defn: 子模型定义, root_schema: 根 Schema（用于解析 $ref）, indent: 缩进前缀
     """递归渲染子模型定义，生成 Markdown 嵌套列表。"""
     lines: list[str] = []
     props = defn.get("properties", {})

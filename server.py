@@ -25,16 +25,16 @@ Novel2Script API Server
 """
 
 import asyncio
-import atexit
+import atexit           # 注册退出清理函数（线程池关闭）
 import json
 import re
-import tempfile
-import threading
+import tempfile         # 临时文件（上传的小说文件暂存）
+import threading        # threading.Lock 保护内存任务状态
 import time
-import traceback
-import uuid
-from concurrent.futures import ThreadPoolExecutor
-from copy import deepcopy
+import traceback        # 打印完整异常堆栈
+import uuid             # 生成唯一 ID（client_id, task_id）
+from concurrent.futures import ThreadPoolExecutor  # 线程池（运行同步 pipeline）
+from copy import deepcopy  # 深拷贝配置（避免并发修改）
 from pathlib import Path
 
 import redis as redis_lib
@@ -59,19 +59,32 @@ app = FastAPI(
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB，防止上传过大的文件撑爆内存
 
-# WebSocket 连接管理器
+# WebSocket 连接管理器（全局单例）
 manager = ConnectionManager()
-_executor = ThreadPoolExecutor(max_workers=4)
-atexit.register(_executor.shutdown, wait=False)
-_memory_tasks: dict[str, dict] = {}  # Redis 不可用时内存中跟踪任务状态
-_memory_tasks_lock = threading.Lock()
 
-_MEMORY_TASKS_MAX = 100
+# 线程池：用于运行同步的 Pipeline（Pipeline 内部调 LLM 是同步阻塞的）
+# max_workers=4：同时最多处理 4 个文件转换请求
+_executor = ThreadPoolExecutor(max_workers=4)
+atexit.register(_executor.shutdown, wait=False)  # 服务器退出时关闭线程池
+
+# --- 内存任务状态跟踪（Redis 不可用时的降级方案）---
+# 用 threading.Lock 而不是 asyncio.Lock，因为这些 dict 会被线程池中的同步代码访问
+# （convert_async 的 run_pipeline 在 ThreadPoolExecutor 线程中修改 _memory_tasks）
+_memory_tasks: dict[str, dict] = {}              # {task_id: {status, step, percent, result, ...}}
+_memory_tasks_lock = threading.Lock()            # 保护 _memory_tasks 的跨线程并发访问
+
+_MEMORY_TASKS_MAX = 100  # 最多保留 100 个任务状态，防止内存泄漏
 
 def _memory_tasks_cleanup():
-    """保留最近 100 个条目，删除最旧的。调用前需持有 _memory_tasks_lock。"""
+    """保留最近 100 个条目，删除最旧的。调用前需持有 _memory_tasks_lock。
+
+    清理步骤：
+    1. 如果 _memory_tasks 长度 <= 100 → 不需要清理
+    2. 按 _created_at 时间戳排序
+    3. 删除最旧的超出 100 的条目
+    """
     if len(_memory_tasks) <= _MEMORY_TASKS_MAX:
         return
     sorted_items = sorted(
@@ -85,26 +98,36 @@ def _memory_tasks_cleanup():
 # --- 请求模型 ---
 
 class ChatRequest(BaseModel):
-    messages: list[dict]
-    script_context: str = ""
-    model: str = ""
-    base_url: str = ""
-    api_key: str = ""
-    stream: bool = True
+    messages: list[dict]        # OpenAI 格式的消息列表 [{role, content}, ...]
+    script_context: str = ""    # 当前剧本上下文（注入 system prompt）
+    model: str = ""             # 用户自定义模型名（空则用默认配置）
+    base_url: str = ""          # 用户自定义 API 地址
+    api_key: str = ""           # 用户自定义 API 密钥
+    stream: bool = True         # 是否使用 SSE 流式输出
 
 
 # --- 工具 ---
 
-def _sanitize_name(filename: str) -> str:
+def _sanitize_name(filename: str) -> str:  # filename: 上传的原始文件名
     """从上传文件名提取安全的目录名，过滤路径遍历字符并限制长度。"""
     name = Path(filename).stem
     name = re.sub(r'[\\/:*?"<>|]', '_', name)[:100]
     return name or "unnamed"
 
 
-def _apply_settings(base: Config, model: str, base_url: str, api_key: str) -> Config:
-    """用用户提供的值覆盖默认配置（返回独立副本，避免并发竞态）。"""
-    config = deepcopy(base)
+def _apply_settings(base: Config, model: str, base_url: str, api_key: str) -> Config:  # base: 默认配置, model/base_url/api_key: 用户覆盖值（空则不覆盖）
+    """用用户提供的值覆盖默认配置（返回独立副本，避免并发竞态）。
+
+    执行步骤：
+    1. deepcopy(base) 创建独立副本（避免多个请求共享同一 Config 对象）
+    2. 如果 model 非空 → config.model = model
+    3. 如果 base_url 非空 → config.api.base_url = base_url
+    4. 如果 api_key 非空 → config.api.api_key = api_key
+    5. 返回修改后的副本
+
+    空值不覆盖：前端可能只传了 model，没传 base_url/api_key，空值表示"用默认的"。
+    """
+    config = deepcopy(base)  # 创建独立副本
     if model:
         config.model = model
     if base_url:
@@ -116,8 +139,15 @@ def _apply_settings(base: Config, model: str, base_url: str, api_key: str) -> Co
 
 # --- 响应模型 ---
 
-def _script_to_response(script: Script, novel_name: str) -> dict:
-    """将 Script 对象转换为 API 响应字典。"""
+def _script_to_response(script: Script, novel_name: str) -> dict:  # script: 剧本对象, novel_name: 小说名（用于响应标识）
+    """将 Script 对象转换为 API 响应字典。
+
+    转换逻辑：
+    1. 遍历 script.scenes，统计每个场景的 dialogue_count 和 action_count
+    2. 组装 scenes_summary 列表（scene_number, slugline, 对白数, 动作数）
+    3. 遍历 script.characters，提取 name 和 description
+    4. 返回完整字典：novel_name, title, scene_count, character_count, scenes, characters, script
+    """
     scenes_summary = []
     for s in script.scenes:
         dialogue_count = sum(1 for c in s.content if c.type == "dialogue")
@@ -151,8 +181,12 @@ _redis_pool_initialized = False
 def _get_redis() -> redis_lib.Redis | None:
     """返回 Redis 连接池客户端，不可用时返回 None。
 
-    首次调用时创建连接池并验证连通性，后续调用直接复用。
-    使用 ConnectionPool 避免每次请求新建 TCP 连接。
+    初始化流程：
+    1. 检查 _redis_pool_initialized 标记，已初始化直接返回 _redis_pool
+    2. 读取配置，如果 config.redis.enabled=False 直接返回 None
+    3. Redis.from_url() 创建连接池（max_connections=10），ping() 测试连通性
+    4. 成功 → 返回连接池；失败 → _redis_pool 设为 None
+    5. 设置 _redis_pool_initialized=True，后续调用不再尝试连接
     """
     global _redis_pool, _redis_pool_initialized
     if _redis_pool_initialized:
@@ -202,6 +236,13 @@ def health():
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket 主端点，处理所有客户端连接。
 
+    连接建立流程：
+    1. 生成唯一 client_id（uuid4）
+    2. manager.connect(websocket, client_id) — 注册连接
+    3. 发送健康信息（当前模型名、API 地址）
+    4. 启动心跳协程（每 30 秒 ping 一次）
+    5. 进入 while True 消息接收循环
+
     消息协议（客户端→服务端）：
     - {action: "chat", request_id, messages, script_context, model, base_url, api_key}
     - {action: "subscribe_task", task_id}
@@ -209,16 +250,16 @@ async def websocket_endpoint(websocket: WebSocket):
     - {action: "pong"}  —— 回复服务端的心跳 ping
 
     消息协议（服务端→客户端）：
-    - {type: "chat_chunk", request_id, chunk_type, content}
-    - {type: "chat_done", request_id}
-    - {type: "chat_error", request_id, error}
-    - {type: "task_progress", task_id, step, percent}
-    - {type: "task_done", task_id, result}
-    - {type: "task_failed", task_id, error}
-    - {type: "ping"}
-    - {type: "health", model, base_url}
+    - {type: "chat_chunk", request_id, chunk_type, content}  —— 聊天流式输出
+    - {type: "chat_done", request_id}  —— 聊天完成
+    - {type: "chat_error", request_id, error}  —— 聊天出错
+    - {type: "task_progress", task_id, step, percent}  —— 任务进度
+    - {type: "task_done", task_id, result}  —— 任务完成
+    - {type: "task_failed", task_id, error}  —— 任务失败
+    - {type: "ping"}  —— 心跳检测
+    - {type: "health", model, base_url}  —— 健康信息
     """
-    client_id = str(uuid.uuid4())
+    client_id = str(uuid.uuid4())  # 每个连接分配唯一 ID
     await manager.connect(websocket, client_id)
 
     # 连接建立后立即发送健康信息，前端据此显示当前模型
@@ -229,21 +270,22 @@ async def websocket_endpoint(websocket: WebSocket):
         "base_url": config.api.base_url,
     })
 
-    # 启动心跳循环，每 30 秒发一次 ping，客户端需回 pong
+    # 启动心跳循环：每 30 秒 ping 一次，检测连接是否还活着
     heartbeat_task = asyncio.create_task(_heartbeat_loop(client_id))
-    chat_tasks: list[asyncio.Task] = []
+    chat_tasks: list[asyncio.Task] = []  # 跟踪所有聊天任务，断开时取消
 
     try:
         while True:
-            data = await websocket.receive_json()
+            data = await websocket.receive_json()  # 阻塞等待客户端消息
             action = data.get("action")
             if action == "chat":
-                # 异步处理聊天，不阻塞消息接收循环
+                # 用 asyncio.create_task 异步处理聊天
+                # 不直接 await，因为 await 会阻塞消息接收循环，导致无法接收其他消息
                 task = asyncio.create_task(_handle_ws_chat(client_id, data))
                 chat_tasks.append(task)
+                # 完成后自动从列表中移除（避免内存泄漏）
                 task.add_done_callback(lambda t: chat_tasks.remove(t) if t in chat_tasks else None)
             elif action == "subscribe_task":
-                # 订阅异步任务的进度推送
                 await manager.subscribe_task(client_id, data["task_id"])
             elif action == "unsubscribe_task":
                 await manager.unsubscribe_task(client_id, data["task_id"])
@@ -255,15 +297,16 @@ async def websocket_endpoint(websocket: WebSocket):
                     "message": f"Unknown action: {action}",
                 })
     except WebSocketDisconnect:
-        pass
+        pass  # 客户端断开，正常退出
     finally:
+        # 清理：取消心跳、取消所有聊天任务、从管理器中移除
         heartbeat_task.cancel()
         for t in chat_tasks:
             t.cancel()
         await manager.disconnect(client_id)
 
 
-async def _heartbeat_loop(client_id: str, interval: int = 30):
+async def _heartbeat_loop(client_id: str, interval: int = 30):  # client_id: 客户端 ID, interval: 心跳间隔秒数
     while True:
         await asyncio.sleep(interval)
         try:
@@ -272,17 +315,25 @@ async def _heartbeat_loop(client_id: str, interval: int = 30):
             break
 
 
-async def _handle_ws_chat(client_id: str, data: dict):
+async def _handle_ws_chat(client_id: str, data: dict):  # client_id: 客户端 ID, data: 客户端发来的消息（含 messages, model 等）
     """WebSocket 聊天处理，流式推送 chunk。
 
-    实现模式：生产者-消费者
-    - 生产者：在线程池中运行同步生成器 chat_stream()
-    - 消费者：在 async 上下文中等待 Queue 消息并推送给客户端
-    - 使用 asyncio.Queue 桥接同步和异步世界
-    - None 作为结束信号，Exception 作为错误信号
+    生产者-消费者模式：
+    1. 创建 asyncio.Queue
+    2. _produce() 在线程池中运行：同步调用 llm.chat_stream()，逐个 chunk 用
+       run_coroutine_threadsafe(queue.put(chunk), loop) 放入 Queue
+       - 结束放 None，出错放 Exception
+    3. 消费者循环：await queue.get() 取出 item
+       - None → 正常完成，发送 chat_done
+       - Exception → 发送 chat_error
+       - dict → 发送 chat_chunk（chunk_type + content）
+
+    run_coroutine_threadsafe 用于在线程中调用 Queue.put() 协程，
+    因为 Queue.put() 是协程，不能在普通线程中直接 await。
     """
-    request_id = data.get("request_id", "")
+    request_id = data.get("request_id", "")  # 前端发的请求 ID，用于匹配响应
     try:
+        # 合并用户自定义配置（model/base_url/api_key）
         config = _apply_settings(
             load_config(),
             data.get("model", ""),
@@ -291,31 +342,39 @@ async def _handle_ws_chat(client_id: str, data: dict):
         )
         llm = LLMClient(config)
 
+        # 构造消息：system prompt + 用户消息
         system_msg = "你是一个专业的编剧助手。你可以帮助用户打磨剧本、修改对白、调整情节结构。请用中文回答。"
         if data.get("script_context"):
             system_msg += f"\n\n当前剧本上下文：\n{data['script_context']}"
 
         messages = [{"role": "system", "content": system_msg}] + data["messages"]
 
-        # chat_stream 是同步生成器，用线程池 + Queue 避免阻塞事件循环
+        # --- 生产者-消费者模式 ---
         queue: asyncio.Queue = asyncio.Queue()
-        loop = asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()  # 获取当前事件循环（供线程中使用）
 
         def _produce():
-            """线程池中运行：逐个 chunk 放入 Queue，None 表示结束。"""
+            """生产者：在线程池中运行，逐个 chunk 放入 Queue。
+
+            执行流程：
+            1. 遍历 llm.chat_stream(messages) 同步生成器
+            2. 每个 chunk 用 asyncio.run_coroutine_threadsafe(queue.put(chunk), loop) 放入 Queue
+            3. 出错时把 Exception 放入 Queue
+            4. finally 中放入 None（结束信号）
+            """
             try:
-                for chunk in llm.chat_stream(messages):
+                for chunk in llm.chat_stream(messages):  # 同步生成器，阻塞线程
                     asyncio.run_coroutine_threadsafe(queue.put(chunk), loop)
             except Exception as e:
-                asyncio.run_coroutine_threadsafe(queue.put(e), loop)
+                asyncio.run_coroutine_threadsafe(queue.put(e), loop)  # 错误也放入 Queue
             finally:
-                asyncio.run_coroutine_threadsafe(queue.put(None), loop)
+                asyncio.run_coroutine_threadsafe(queue.put(None), loop)  # 结束信号
 
-        _executor.submit(_produce)
+        _executor.submit(_produce)  # 提交到线程池，立即返回
 
         # 消费者循环：从 Queue 取出 chunk 推送给客户端
         while True:
-            item = await queue.get()
+            item = await queue.get()  # 阻塞等待（异步阻塞，不卡事件循环）
             if item is None:  # 生产者已完成
                 break
             if isinstance(item, Exception):  # 生产者出错
@@ -325,13 +384,15 @@ async def _handle_ws_chat(client_id: str, data: dict):
                     "error": str(item),
                 })
                 return
+            # 正常 chunk，推送给客户端
             await manager.send_to_client(client_id, {
                 "type": "chat_chunk",
                 "request_id": request_id,
-                "chunk_type": item["type"],
+                "chunk_type": item["type"],  # "reasoning" 或 "content"
                 "content": item["content"],
             })
 
+        # 全部推送完成
         await manager.send_to_client(client_id, {
             "type": "chat_done",
             "request_id": request_id,
@@ -344,7 +405,7 @@ async def _handle_ws_chat(client_id: str, data: dict):
             "error": str(e),
         })
     except Exception as e:
-        traceback.print_exc()
+        traceback.print_exc()  # 打印完整堆栈到服务器日志
         await manager.send_to_client(client_id, {
             "type": "chat_error",
             "request_id": request_id,
@@ -392,12 +453,25 @@ def convert(
 
 @app.post("/api/v1/convert/stream")
 def convert_stream(
-    file: UploadFile = File(...),
-    model: str = Form(""),
-    base_url: str = Form(""),
-    api_key: str = Form(""),
+    file: UploadFile = File(...),       # 上传的小说 .txt 文件
+    model: str = Form(""),              # 用户自定义模型名
+    base_url: str = Form(""),           # 用户自定义 API 地址
+    api_key: str = Form(""),            # 用户自定义 API 密钥
 ):
-    """上传小说 .txt 文件，SSE 流式返回进度 + 最终结果（无需 Redis）。"""
+    """上传小说 .txt 文件，SSE 流式返回进度 + 最终结果（无需 Redis）。
+
+    SSE（Server-Sent Events）流程：
+    1. 上传文件暂存到临时目录
+    2. 创建 queue.Queue（线程安全）和 threading.Event（取消信号）
+    3. 定义回调函数：progress_callback 和 chunk_result_callback，把消息放入 Queue
+    4. 在线程池中运行 pipeline，通过回调推动进度
+    5. event_generator() 从 Queue 中取消息，格式化为 SSE 事件流返回
+
+    SSE 格式：每一行以 "data: " 开头，JSON 格式，以 \n\n 结尾
+    浏览器用 EventSource API 接收。
+
+    超时处理：msg_queue.get(timeout=600) 最多等 10 分钟，超时则取消 pipeline。
+    """
     if not file.filename or not file.filename.lower().endswith(".txt"):
         raise HTTPException(status_code=400, detail="只接受 .txt 文件")
 
@@ -408,15 +482,21 @@ def convert_stream(
         raise HTTPException(status_code=400, detail="文件为空")
 
     novel_name = _sanitize_name(file.filename)
+    # 上传文件暂存到临时目录（pipeline 需要文件路径，不能直接读内存）
     with tempfile.NamedTemporaryFile(mode="wb", suffix=".txt", delete=False) as tmp:
         tmp.write(content)
         tmp_path = tmp.name
 
     def event_generator():
-        import queue
-        msg_queue: queue.Queue = queue.Queue()
-        cancel_event = threading.Event()
+        """SSE 事件生成器：从 queue.Queue 读取消息，格式化为 SSE 事件流。
 
+        SSE 格式：每一行以 "data: " 开头，JSON 格式，以 \\n\\n 结尾
+        """
+        import queue
+        msg_queue: queue.Queue = queue.Queue()  # 线程间通信：pipeline → 生成器
+        cancel_event = threading.Event()  # 取消信号：超时或客户端断开时置位
+
+        # 回调函数：pipeline 在关键步骤调用，把消息放入 Queue
         def progress_callback(step: str, percent: int):
             msg_queue.put({"type": "progress", "step": step, "percent": percent})
 
@@ -424,13 +504,14 @@ def convert_stream(
             msg_queue.put({"type": "chunk_result", "data": data})
 
         def run_pipeline():
+            """在线程池中运行 pipeline，通过回调把进度推入 Queue。"""
             try:
                 config = _apply_settings(load_config(), model, base_url, api_key)
                 pipeline = Pipeline(
                     config,
                     progress_callback=progress_callback,
                     chunk_result_callback=chunk_result_callback,
-                    cancel_event=cancel_event,
+                    cancel_event=cancel_event,  # 传入取消事件，pipeline 会定期检查
                 )
                 script = pipeline.run(tmp_path, novel_name)
                 result = _script_to_response(script, novel_name)
@@ -438,15 +519,16 @@ def convert_stream(
             except Exception as e:
                 msg_queue.put({"type": "error", "error": f"{type(e).__name__}: {e}"})
             finally:
-                Path(tmp_path).unlink(missing_ok=True)
+                Path(tmp_path).unlink(missing_ok=True)  # 清理临时文件
 
-        _executor.submit(run_pipeline)
+        _executor.submit(run_pipeline)  # 提交到线程池
 
         try:
             while True:
                 try:
-                    item = msg_queue.get(timeout=600)
+                    item = msg_queue.get(timeout=600)  # 最多等 10 分钟
                 except Exception:
+                    # 超时：pipeline 可能卡住了，取消它
                     cancel_event.set()
                     yield f"data: {json.dumps({'type': 'error', 'error': '处理超时'})}\n\n"
                     break
@@ -463,7 +545,7 @@ def convert_stream(
                 else:  # progress
                     yield f"data: {json.dumps({'type': 'progress', 'step': item['step'], 'percent': item['percent']})}\n\n"
         finally:
-            cancel_event.set()
+            cancel_event.set()  # 无论什么原因退出，都取消 pipeline
 
     return StreamingResponse(
         event_generator(),
@@ -485,8 +567,15 @@ def convert_async(
 ):
     """异步转换：在服务端线程池中运行 pipeline，通过 Redis/WS 推送进度。
 
-    Redis 可用时通过 Pub/Sub 推送进度给 WebSocket 客户端，
-    Redis 不可用时降级到 HTTP 轮询（通过内存状态跟踪）。
+    执行流程：
+    1. 生成唯一 task_id，初始化任务状态（Redis hset 或内存 dict）
+    2. 定义 progress_callback：每次调用时更新 Redis hash + publish 到 Pub/Sub channel
+       - Redis 不可用时写入 _memory_tasks dict（供 HTTP 轮询）
+    3. 在线程池中运行 run_pipeline()：
+       - 成功 → 更新状态为 done，写入 result
+       - 失败 → 更新状态为 failed，写入 error
+    4. 返回 {"task_id": task_id} 给客户端
+    5. 客户端通过 GET /api/v1/tasks/{task_id} 轮询进度
     """
     r = _get_redis()
 
@@ -588,8 +677,15 @@ def convert_async(
 
 
 @app.get("/api/v1/tasks/{task_id}")
-def get_task_status(task_id: str):
-    """查询异步转换任务的进度和结果。Redis 优先，内存后备。"""
+def get_task_status(task_id: str):  # task_id: 异步任务 ID
+    """查询异步转换任务的进度和结果。
+
+    查询流程：
+    1. 先查 Redis：r.hgetall(f"task:{task_id}") 获取所有字段
+       - 有数据 → 解析 status/step/percent/result/error 返回
+    2. Redis 没数据 → 查内存 _memory_tasks dict（需加锁）
+    3. 都没有 → 抛出 404
+    """
     # 先查 Redis
     r = _get_redis()
     if r:
@@ -635,7 +731,14 @@ def get_task_status(task_id: str):
 
 @app.post("/api/v1/chat")
 def chat(req: ChatRequest):
-    """常规 AI 对话，支持 SSE 流式输出。"""
+    """常规 AI 对话，支持 SSE 流式输出。
+
+    流程：
+    1. _apply_settings() 合并用户自定义配置
+    2. 构造 system prompt（含可选的 script_context）
+    3. 非流式 → llm.chat() 直接返回完整回复
+    4. 流式 → event_generator() 从 llm.chat_stream() 逐块 yield SSE 事件
+    """
     config = _apply_settings(load_config(), req.model, req.base_url, req.api_key)
     llm = LLMClient(config)
 
@@ -681,7 +784,7 @@ def get_schema():
 
 
 @app.get("/api/v1/download/{novel_name}")
-def download_script(novel_name: str):
+def download_script(novel_name: str):  # novel_name: 小说名（用于定位 YAML 文件）
     """下载已生成的 YAML 剧本文件。"""
     safe_name = re.sub(r'[\\/:*?"<>|]', '_', novel_name)[:100]
     yaml_path = Path(load_config().pipeline.output_dir) / safe_name / f"{safe_name}.yaml"

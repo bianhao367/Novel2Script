@@ -24,8 +24,8 @@ load_dotenv(ROOT_DIR / ".env")
 @dataclass
 class ApiConfig:
     """OpenAI 兼容 API 的连接配置。"""
-    base_url: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    api_key: str = os.getenv("OPENAI_API_KEY", "")
+    base_url: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")  # API 基础地址
+    api_key: str = os.getenv("OPENAI_API_KEY", "")  # API 密钥
 
 
 @dataclass
@@ -50,43 +50,54 @@ class RedisConfig:
 @dataclass
 class Config:
     """全局配置对象，聚合 API、Pipeline、Redis 三部分配置。"""
-    api: ApiConfig = field(default_factory=ApiConfig)
-    pipeline: PipelineConfig = field(default_factory=PipelineConfig)
-    redis: RedisConfig = field(default_factory=RedisConfig)
+    api: ApiConfig = field(default_factory=ApiConfig)  # API 连接配置
+    pipeline: PipelineConfig = field(default_factory=PipelineConfig)  # 流程参数配置
+    redis: RedisConfig = field(default_factory=RedisConfig)  # Redis 配置
     model: str = ""            # LLM 模型名称（从 config.py 读取）
     temperature: float = 0.7   # 生成温度，越高越随机
     max_tokens: int = 4096     # 单次最大生成 token 数
 
 
 # 配置缓存：避免每次请求都重新执行 config.py
+# load_config() 每次调用都会动态 import config.py，如果不缓存既慢又可能有副作用
+# 通过比较文件修改时间（mtime）判断是否需要重新加载
 _cached_config: Config | None = None
-_config_mtime: float = 0.0
+_config_mtime: float = 0.0  # 记录 config.py 的文件修改时间，用于判断是否需要重新加载
 
 
 def load_config() -> Config:
-    """
-    加载配置：API 凭据来自 .env，运行参数来自根目录 config.py。
+    """加载配置：API 凭据来自 .env，运行参数来自根目录 config.py。
 
-    根目录 config.py 是一个普通 Python 文件，通过 importlib 动态加载，
-    读取其中的 MODEL、CHUNK_SIZE、OUTPUT_DIR 等变量。
+    加载流程：
+    1. 获取 config.py 的文件修改时间（mtime）
+    2. 如果缓存存在且 mtime 未变 → 直接返回缓存
+    3. 用 importlib.util.spec_from_file_location() 动态加载 config.py
+    4. 从 config.py 中读取变量（getattr 读取，不存在用默认值）
+    5. 组装 Config 对象，缓存到 _cached_config
 
-    带文件修改时间缓存：config.py 未变化时直接返回缓存，避免重复执行。
+    配置分层：
+    - .env 存敏感信息（API Key），不提交 Git
+    - config.py 存运行参数（模型名、分块大小），可提交 Git 供团队共享
     """
     global _cached_config, _config_mtime
 
     root_config_path = ROOT_DIR / "config.py"
-    current_mtime = root_config_path.stat().st_mtime
+    current_mtime = root_config_path.stat().st_mtime  # 获取文件最后修改时间
 
+    # 如果缓存存在且文件没被修改过，直接返回缓存
     if _cached_config is not None and current_mtime == _config_mtime:
         return _cached_config
 
+    # 文件被修改了，重新加载
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("root_config", root_config_path)
     root_cfg = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(root_cfg)
+    spec.loader.exec_module(root_cfg)  # 执行 config.py，里面的变量就变成了 root_cfg 的属性
 
-    api_cfg = ApiConfig()
+    api_cfg = ApiConfig()  # API 配置从 .env 读取，这里不需要再覆盖
+    # getattr(root_cfg, "变量名", 默认值)：从 config.py 中读取变量，不存在则用默认值
+    # 这样用户只改 config.py 中关心的参数，其他保持默认
     pipeline_cfg = PipelineConfig(
         chunk_size=getattr(root_cfg, "CHUNK_SIZE", 3000),
         output_dir=getattr(root_cfg, "OUTPUT_DIR", "./output"),
