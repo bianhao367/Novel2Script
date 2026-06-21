@@ -44,7 +44,7 @@ class PipelineConfig:
 class RedisConfig:
     """Redis 连接配置，用于异步任务队列和进度推送。"""
     url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    enabled: bool = os.getenv("REDIS_ENABLED", "true").lower() == "true"
+    enabled: bool = os.getenv("REDIS_ENABLED", "false").lower() == "true"
 
 
 @dataclass

@@ -10,15 +10,14 @@
 # 1. 安装依赖
 pip install -r requirements.txt
 
-# 2. 编辑 .env，填入 API 凭据（可选，也可在 Web 界面中设置）
-# OPENAI_API_KEY=sk-your-key-here
-# OPENAI_BASE_URL=https://api.openai.com/v1
+# 2. 创建 .env 并填入 API 凭据
+cp .env.example .env
+# 编辑 .env：写入你的 OPENAI_BASE_URL 和 OPENAI_API_KEY
 
-# 3. 编辑 config.py，填写模型名和运行参数
-# MODEL = "gpt-4o"   ← 改成你实际使用的模型名
+# 3. 编辑 config.py，填写模型名
+# MODEL = "your-model-name"
 
 # 4. 启动 Web 服务
-redis-server
 python server.py
 ```
 
